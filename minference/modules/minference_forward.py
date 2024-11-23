@@ -3,6 +3,7 @@
 
 import inspect
 import json
+import numpy as np
 import os
 import warnings
 from importlib import import_module
@@ -24,6 +25,7 @@ if _is_package_available("vllm"):
 
 from ..ops.block_sparse_flash_attention import block_sparse_attention
 from ..ops.pit_sparse_flash_attention_v2 import vertical_slash_sparse_attention
+from ..ops.pit_sparse_flash_attention_v2_cascade import vertical_slash_sparse_attention_cascade
 from ..ops.streaming_kernel import streaming_forward, streaming_forward2
 from .snap_kv import *
 
@@ -38,6 +40,7 @@ LAST_Q_MASK = arange[None, None, :, None] >= arange[None, None, None, :]
 ROPE_TYPE = None
 SEARCH_MASK = None
 
+
 def set_rope_type(self):
     global ROPE_TYPE
     if ROPE_TYPE is not None:
@@ -51,6 +54,7 @@ def set_rope_type(self):
         ROPE_TYPE = "max_seq_len"
     else:
         ROPE_TYPE = "position_ids"
+
 
 def get_cos_sin(self, value_states, kv_seq_len, position_ids):
     if self.rotary_emb.inv_freq is not None and value_states.device != self.rotary_emb.inv_freq.device:
@@ -98,24 +102,28 @@ def init_minference_parameters(self):
         apply_rotary_pos_emb = getattr(import_module(model_path), "apply_rotary_pos_emb")
         self.apply_rotary_pos_emb = True
 
+
 def sum_all_diagonal_matrix(mat: torch.tensor):
     b, h, n, m = mat.shape
-    zero_mat = torch.zeros((b, h, n, n)).to(mat.device) # Zero matrix used for padding
-    mat_padded =  torch.cat((zero_mat, mat, zero_mat), -1) # pads the matrix on left and right
-    mat_strided = mat_padded.as_strided((1, 1, n, n + m), (1, n * (2 * n + m), 2 * n + m + 1, 1)) # Change the strides
-    sum_diags = torch.sum(mat_strided, 2) # Sums the resulting matrix's columns
-    return sum_diags[:,:,1:]
+    zero_mat = torch.zeros((b, h, n, n)).to(mat.device)  # Zero matrix used for padding
+    mat_padded = torch.cat((zero_mat, mat, zero_mat), -1)  # pads the matrix on left and right
+    mat_strided = mat_padded.as_strided((1, 1, n, n + m), (1, n * (2 * n + m), 2 * n + m + 1, 1))  # Change the strides
+    sum_diags = torch.sum(mat_strided, 2)  # Sums the resulting matrix's columns
+    return sum_diags[:, :, 1:]
+
 
 def gather(t, dim, i):
     """A broadcasting version of torch.gather."""
     dim += (dim < 0) * t.ndim
-    return t.gather(dim, i.expand(*t.shape[:dim], i.shape[dim], *t.shape[dim + 1 :]))
+    return t.gather(dim, i.expand(*t.shape[:dim], i.shape[dim], *t.shape[dim + 1:]))
+
 
 def gather_qkv(q, k, v, attention_mask):
     attn_weights = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(q.size(-1)) + attention_mask
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
     attn_output = torch.matmul(attn_weights, v)
     return attn_output
+
 
 def search_pattern(q, k, head):
     q_len = q.shape[2]
@@ -125,61 +133,61 @@ def search_pattern(q, k, head):
         last_q = 64
         q_len = q.shape[2]
         qk_idxs = [ii + q_len for ii in list(range(-last_q, 0, 1))]
-        qk = torch.matmul(q[:,:,qk_idxs,:], k.transpose(2, 3))/ math.sqrt(head_dim) + attention_mask[:,:,qk_idxs]
+        qk = torch.matmul(q[:, :, qk_idxs, :], k.transpose(2, 3)) / math.sqrt(head_dim) + attention_mask[:, :, qk_idxs]
         qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
         vertical = qk.sum(-2, keepdim=True)
-        vertical[...,:30] = torch.inf
+        vertical[..., :30] = torch.inf
         vertical_topk = torch.topk(-vertical, q_len - vertical_size, -1).indices
 
-        slash = sum_all_diagonal_matrix(qk)[...,:-last_q + 1]
-        slash[...,-30:] = torch.inf
+        slash = sum_all_diagonal_matrix(qk)[..., :-last_q + 1]
+        slash[..., -30:] = torch.inf
         slash_topk = slash
         slash = torch.topk(slash, slash_size, -1).indices - (q_len - 1)
         slash = torch.stack([torch.sparse.spdiags(torch.ones(slash_size, q_len), slash.cpu()[0][_], (q_len, q_len)).to_dense() for _ in range(1)]).to(q.device)
 
         est_attn = torch.ones_like(attn_weights)
         dim = 3
-        est_attn = est_attn.scatter(3, vertical_topk.expand(*est_attn.shape[:dim], vertical_topk.shape[dim], *est_attn.shape[dim + 1 :]), 0)
+        est_attn = est_attn.scatter(3, vertical_topk.expand(*est_attn.shape[:dim], vertical_topk.shape[dim], *est_attn.shape[dim + 1:]), 0)
         est_attn = est_attn + slash
 
         est_attn = (est_attn > 0).float()
         est_attn = torch.tril(est_attn)
         attn_weights_x = attn_weights * est_attn
-        res3 = attn_weights_x[:,:,2500:].sum(-1).mean(-1).squeeze().float().detach().cpu().numpy()
+        res3 = attn_weights_x[:, :, 2500:].sum(-1).mean(-1).squeeze().float().detach().cpu().numpy()
         return res3
 
     def stream_llm(vertical_size, slash_size):
         q_len = q.shape[2]
 
         mask = torch.triu(torch.tril(torch.ones(q_len, q_len), 0), -slash_size).to(q)
-        mask[:,:vertical_size] = 1
+        mask[:, :vertical_size] = 1
         mask = mask.unsqueeze(0).unsqueeze(1)
 
         est_attn = torch.tril(mask)
         attn_weights_x = attn_weights * est_attn
-        res3 = attn_weights_x[:,:,2500:].sum(-1).mean(-1).squeeze().float().detach().cpu().numpy()
+        res3 = attn_weights_x[:, :, 2500:].sum(-1).mean(-1).squeeze().float().detach().cpu().numpy()
         return res3
 
     def block_sparse(topk_ratio, slash_size=None):
-        block_num = (q_len -1) // 32 + 1
-        block_q = torch.zeros(1,1,block_num * 32,head_dim).to(q)
-        block_q[:,:,:q_len] = q
-        block_q = block_q.reshape(1,1,block_num,32,-1).mean(-2)
-        block_k = torch.zeros(1,1,block_num * 32,head_dim).to(k)
-        block_k[:,:,:q_len] = k
-        block_k = block_k.reshape(1,1,block_num,32,-1).mean(-2)
+        block_num = (q_len - 1) // 32 + 1
+        block_q = torch.zeros(1, 1, block_num * 32, head_dim).to(q)
+        block_q[:, :, :q_len] = q
+        block_q = block_q.reshape(1, 1, block_num, 32, -1).mean(-2)
+        block_k = torch.zeros(1, 1, block_num * 32, head_dim).to(k)
+        block_k[:, :, :q_len] = k
+        block_k = block_k.reshape(1, 1, block_num, 32, -1).mean(-2)
 
-        qk = torch.matmul(block_q, block_k.transpose(2, 3)) + attention_mask[:,:,:block_num,:block_num]
+        qk = torch.matmul(block_q, block_k.transpose(2, 3)) + attention_mask[:, :, :block_num, :block_num]
         est_attn = torch.ones_like(qk)
-        block_topk = torch.topk(-qk, block_num - block_num//topk_ratio, -1).indices
+        block_topk = torch.topk(-qk, block_num - block_num // topk_ratio, -1).indices
 
         dim = 3
-        est_attn = est_attn.scatter(3, block_topk.expand(*est_attn.shape[:dim], block_topk.shape[dim], *est_attn.shape[dim + 1 :]), 0)
-        est_attn = est_attn.unsqueeze(3).unsqueeze(-1).repeat(1,1,1,32,1,32).reshape(1,1,block_num * 32, block_num * 32)[...,:q_len,:q_len]
+        est_attn = est_attn.scatter(3, block_topk.expand(*est_attn.shape[:dim], block_topk.shape[dim], *est_attn.shape[dim + 1:]), 0)
+        est_attn = est_attn.unsqueeze(3).unsqueeze(-1).repeat(1, 1, 1, 32, 1, 32).reshape(1, 1, block_num * 32, block_num * 32)[..., :q_len, :q_len]
         est_attn = torch.tril(est_attn)
 
         attn_weights_x = attn_weights * est_attn
-        res2 = attn_weights_x[:,:,2500:].sum(-1).mean(-1).squeeze().float().detach().cpu().numpy()
+        res2 = attn_weights_x[:, :, 2500:].sum(-1).mean(-1).squeeze().float().detach().cpu().numpy()
         return res2
 
     global SEARCH_MASK
@@ -217,27 +225,31 @@ def search_pattern(q, k, head):
     print(head, best_ty, best_v, best_s, best_score)
     return (best_ty, best_v, best_s, best_score)
 
+
 def search_pattern_v2(q, k, v, head):
     q_len = q.shape[2]
     head_dim = q.shape[-1]
+
     def vertical_and_slash_kernel(q, k, v, vertical_size, slash_size):
-        vertical_size, slash_size  = min(q_len, max(vertical_size, 30)), min(q_len, max(slash_size, 50))
+        vertical_size, slash_size = min(q_len, max(vertical_size, 30)), min(q_len, max(slash_size, 50))
         last_q = 64
-        qk = torch.einsum(f'bhmk, bhnk -> bhmn', q[:,:,-last_q:,:], k)
+        qk = torch.einsum(f'bhmk, bhnk -> bhmn', q[:, :, -last_q:, :], k)
         qk[:, :, :, -last_q:] = torch.where(LAST_Q_MASK, qk[:, :, :, -last_q:], -torch.inf)
         qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
         vertical = qk.sum(-2, keepdim=True)
-        vertical[...,:30] = torch.inf
+        vertical[..., :30] = torch.inf
         vertical_topk = torch.topk(vertical, vertical_size, -1).indices
 
-        slash = sum_all_diagonal_matrix(qk)[...,:-last_q + 1]
-        slash[...,-30:] = torch.inf
+        slash = sum_all_diagonal_matrix(qk)[..., :-last_q + 1]
+        slash[..., -30:] = torch.inf
         slash_topk = slash
         slash = (q_len - 1) - torch.topk(slash, slash_size, -1).indices
 
         return vertical_slash_sparse_attention(q, k, v, vertical_topk, slash)
+
     def dense(q, k, v, vertical_size=None, slash_size=None):
-        return flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1,2), 0.0, softmax_scale=None, causal=q_len != 1).view(bsz, 1, q_len, head_dim)
+        return flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), 0.0, softmax_scale=None, causal=q_len != 1).view(bsz, 1, q_len, head_dim)
+
     def block_sparse_kernel(q, k, v, vertical_size=None, slash_size=None):
         topk = 100
         return block_sparse_attention(q, k, v, topk)
@@ -266,47 +278,55 @@ def search_pattern_v2(q, k, v, head):
     print(head, best_ty, best_v, best_s, best_score)
     return all_info
 
+
 def shift_matrix(mat):
     b, h, _, n = mat.shape
-    zero_mat = torch.zeros((b, h, n, n)).to(mat.device) # Zero matrix used for padding
-    mat_padded =  torch.cat((zero_mat, mat, zero_mat), -1) # pads the matrix on left and right
-    mat_strided = mat_padded.as_strided((1, 1, n, n + 2 * n), (1, n * (2 * n + n), 2 * n + n - 1, 1)) # Change the strides
-    return mat_strided[...,2 * n-1:-1]
+    zero_mat = torch.zeros((b, h, n, n)).to(mat.device)  # Zero matrix used for padding
+    mat_padded = torch.cat((zero_mat, mat, zero_mat), -1)  # pads the matrix on left and right
+    mat_strided = mat_padded.as_strided((1, 1, n, n + 2 * n), (1, n * (2 * n + n), 2 * n + n - 1, 1))  # Change the strides
+    return mat_strided[..., 2 * n - 1:-1]
+
 
 def repeat(self, q, k, v, attention_mask):
     q_len = q.shape[2]
     if q_len == 1:
         return gather_qkv(q, k, v, attention_mask)
-    qk = torch.matmul(q[:,:,-1:,:], k.transpose(2, 3)) / math.sqrt(self.head_dim)
-    qk = qk.repeat(1,1,q_len, 1)
+    qk = torch.matmul(q[:, :, -1:, :], k.transpose(2, 3)) / math.sqrt(self.head_dim)
+    qk = qk.repeat(1, 1, q_len, 1)
     qk = shift_matrix(qk) + attention_mask
     attn_weights = nn.functional.softmax(qk, dim=-1, dtype=torch.float32).to(q.dtype)
     attn_output = torch.matmul(attn_weights, v)
     return attn_output
 
-def gather_last_q_vertical_slash_topk_v4(self, q, k, v, head_id):
+
+def gather_last_q_vertical_slash_topk_v4(
+    self,
+    q, k, v, head_id,
+    cached_k=None, cached_v=None, cached_mask=None,
+    scores_out=None, first_it=False,
+):
     kv_seq_len = k.size(2)
 
     def vertical_and_slash(attn_weights, vertical_size, slash_size):
         last_q = 64
         q_len = q.shape[2]
-        vertical_size, slash_size  = min(q_len, max(vertical_size, 30)), min(q_len, max(slash_size, 50))
+        vertical_size, slash_size = min(q_len, max(vertical_size, 30)), min(q_len, max(slash_size, 50))
         qk_idxs = [ii + q_len for ii in list(range(-last_q, 0, 1))]
-        qk = torch.matmul(q[:,:,qk_idxs,:], k.transpose(2, 3))/ math.sqrt(self.head_dim) + attention_mask[:,:,qk_idxs]
+        qk = torch.matmul(q[:, :, qk_idxs, :], k.transpose(2, 3)) / math.sqrt(self.head_dim) + attention_mask[:, :, qk_idxs]
         qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
         vertical = qk.sum(-2, keepdim=True)
-        vertical[...,:30] = -self.ne_inf
+        vertical[..., :30] = -self.ne_inf
         vertical_topk = torch.topk(-vertical, q_len - vertical_size, -1).indices
 
-        slash = sum_all_diagonal_matrix(qk)[...,:-last_q + 1]
-        slash[...,-30:] = -self.ne_inf
+        slash = sum_all_diagonal_matrix(qk)[..., :-last_q + 1]
+        slash[..., -30:] = -self.ne_inf
         slash_topk = slash
         slash = torch.topk(slash, slash_size, -1).indices - (q_len - 1)
         slash = torch.stack([torch.sparse.spdiags(torch.ones(slash_size, q_len), slash.cpu()[0][_], (q_len, q_len)).to_dense() for _ in range(1)]).to(q.device)
 
         est_attn = torch.ones_like(attn_weights)
         dim = 3
-        est_attn = est_attn.scatter(3, vertical_topk.expand(*est_attn.shape[:dim], vertical_topk.shape[dim], *est_attn.shape[dim + 1 :]), 0)
+        est_attn = est_attn.scatter(3, vertical_topk.expand(*est_attn.shape[:dim], vertical_topk.shape[dim], *est_attn.shape[dim + 1:]), 0)
         est_attn = est_attn + slash
 
         est_attn = (est_attn > 0).float()
@@ -322,7 +342,7 @@ def gather_last_q_vertical_slash_topk_v4(self, q, k, v, head_id):
         q_len = q.shape[2]
         vertical_size, slash_size = min(q_len, max(vertical_size, 30)), min(q_len, max(slash_size, 50))
         mask = torch.triu(torch.tril(torch.ones(q_len, q_len), 0), -slash_size).to(q)
-        mask[:,:vertical_size] = 1
+        mask[:, :vertical_size] = 1
         mask = mask.unsqueeze(0).unsqueeze(1)
 
         est_attn = torch.tril(mask)
@@ -334,27 +354,27 @@ def gather_last_q_vertical_slash_topk_v4(self, q, k, v, head_id):
         return attn_weights
 
     def block_sparse(attn_weights, topk_ratio, slash_size=None, block_size=8):
-        block_num = (q_len -1) // block_size + 1
-        block_q = torch.zeros(1,1,block_num * block_size,head_dim).to(q)
-        block_q[:,:,:q_len] = q
-        block_q = block_q.reshape(1,1,block_num,block_size,-1).mean(-2)
-        block_k = torch.zeros(1,1,block_num * block_size,head_dim).to(k)
-        block_k[:,:,:q_len] = k
-        block_k = block_k.reshape(1,1,block_num,block_size,-1).mean(-2)
+        block_num = (q_len - 1) // block_size + 1
+        block_q = torch.zeros(1, 1, block_num * block_size, head_dim).to(q)
+        block_q[:, :, :q_len] = q
+        block_q = block_q.reshape(1, 1, block_num, block_size, -1).mean(-2)
+        block_k = torch.zeros(1, 1, block_num * block_size, head_dim).to(k)
+        block_k[:, :, :q_len] = k
+        block_k = block_k.reshape(1, 1, block_num, block_size, -1).mean(-2)
 
-        qk = torch.matmul(block_q, block_k.transpose(2, 3)) + attention_mask[:,:,:block_num,:block_num]
+        qk = torch.matmul(block_q, block_k.transpose(2, 3)) + attention_mask[:, :, :block_num, :block_num]
         est_attn = torch.ones_like(qk)
-        block_topk = torch.topk(-qk, block_num - block_num//topk_ratio, -1).indices
+        block_topk = torch.topk(-qk, block_num - block_num // topk_ratio, -1).indices
 
         dim = 3
-        est_attn = est_attn.scatter(3, block_topk.expand(*est_attn.shape[:dim], block_topk.shape[dim], *est_attn.shape[dim + 1 :]), 0)
-        est_attn = est_attn.unsqueeze(3).unsqueeze(-1).repeat(1,1,1,block_size,1,block_size).reshape(1,1,block_num * block_size, block_num * block_size)[...,:q_len,:q_len]
+        est_attn = est_attn.scatter(3, block_topk.expand(*est_attn.shape[:dim], block_topk.shape[dim], *est_attn.shape[dim + 1:]), 0)
+        est_attn = est_attn.unsqueeze(3).unsqueeze(-1).repeat(1, 1, 1, block_size, 1, block_size).reshape(1, 1, block_num * block_size, block_num * block_size)[..., :q_len, :q_len]
         est_attn = torch.tril(est_attn)
         est_attn = (est_attn == 0).int()
         attn_weights = attn_weights + est_attn
         return attn_weights
 
-    def dialted(q,k,v, type):
+    def dialted(q, k, v, type):
         q_len = q.shape[2]
         n_init = min(1024, q_len)
         vertical_topk = torch.arange(0, n_init, device=q.device)[None, None, None, :]
@@ -371,37 +391,65 @@ def gather_last_q_vertical_slash_topk_v4(self, q, k, v, head_id):
         return vertical_slash_sparse_attention(q, k, v, vertical_topk, slash)
 
     def vertical_and_slash_kernel(q, k, v, vertical_size, slash_size):
-        vertical_size, slash_size  = min(q_len, max(vertical_size, 30)), min(q_len, max(slash_size, 50))
+        vertical_size, slash_size = min(q_len, max(vertical_size, 30)), min(q_len, max(slash_size, 50))
         last_q = min(64, q_len)
-        qk = torch.einsum(f'bhmk, bhnk -> bhmn', q[:,:,-last_q:,:], k) / math.sqrt(self.head_dim)
-        qk[:, :, :, -last_q:] = torch.where(LAST_Q_MASK[...,-last_q:,-last_q:].to(q.device), qk[:, :, :, -last_q:], -torch.inf)
+        qk = torch.einsum(f'bhmk, bhnk -> bhmn', q[:, :, -last_q:, :], k) / math.sqrt(self.head_dim)
+        qk[:, :, :, -last_q:] = torch.where(LAST_Q_MASK[..., -last_q:, -last_q:].to(q.device), qk[:, :, :, -last_q:], -torch.inf)
         qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
         vertical = qk.sum(-2, keepdim=True)
-        vertical[...,:30] = torch.inf
+        vertical[..., :30] = torch.inf
         vertical_topk = torch.topk(vertical, vertical_size, -1).indices
 
-        slash = sum_all_diagonal_matrix(qk)[...,:-last_q + 1]
-        slash[...,-100:] = torch.inf
+        slash = sum_all_diagonal_matrix(qk)[..., :-last_q + 1]
+        slash[..., -100:] = torch.inf
         slash_topk = slash
         slash = (q_len - 1) - torch.topk(slash, slash_size, -1).indices
 
         return vertical_slash_sparse_attention(q, k, v, vertical_topk, slash)
 
-    def vertical_and_slash_kernel_extend(q, k, v, vertical_size, slash_size):
-        vertical_size, slash_size  = min(q_len, max(vertical_size + 100, 30)), min(q_len, max(slash_size, 50))
+    def vertical_and_slash_kernel_cascade(ck, cv, cm, q, k, v, vertical_size, slash_size):
+        vertical_size, slash_size = min(q_len, max(vertical_size, 30)), min(q_len, max(slash_size, 50))
         last_q = min(64, q_len)
-        last_start = 100
-        qk = torch.einsum(f'bhmk, bhnk -> bhmn', q[:,:,-last_q-last_start:-last_start,:], k) / math.sqrt(self.head_dim)
-        qk[:, :, :, -last_start:] = -torch.inf
-        qk[:, :, :, -last_q-last_start:-last_start] = torch.where(LAST_Q_MASK[...,-last_q:,-last_q:].to(q.device), qk[:, :, :, -last_q-last_start:-last_start], -torch.inf)
+        qk = torch.einsum(f'bhmk, bhnk -> bhmn', q[:, :, -last_q:, :], k) / math.sqrt(self.head_dim)
+        qk[:, :, :, -last_q:] = torch.where(LAST_Q_MASK[..., -last_q:, -last_q:].to(q.device), qk[:, :, :, -last_q:], -torch.inf)
         qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
         vertical = qk.sum(-2, keepdim=True)
-        vertical[...,:30] = torch.inf
-        vertical[...,-100:] = torch.inf
+
+        if first_it:
+            vertical[..., :64] = torch.inf
+
         vertical_topk = torch.topk(vertical, vertical_size, -1).indices
 
-        slash = sum_all_diagonal_matrix(qk)[...,:-last_q + 1]
-        slash[...,-100:] = torch.inf
+        scores_out[0, head_id // self.num_key_value_groups] = \
+            torch.amax(
+                torch.stack((
+                    vertical[0, 0, 0].to(scores_out.dtype),
+                    scores_out[0, head_id // self.num_key_value_groups]
+                ), 0), 0
+        )
+
+        slash = sum_all_diagonal_matrix(qk)[..., :-last_q + 1]
+        slash[..., -100:] = torch.inf
+        slash_topk = slash
+        slash = (q_len - 1) - torch.topk(slash, slash_size, -1).indices
+
+        return vertical_slash_sparse_attention_cascade(ck, cv, cm, q, k, v, vertical_topk, slash)
+
+    def vertical_and_slash_kernel_extend(q, k, v, vertical_size, slash_size):
+        vertical_size, slash_size = min(q_len, max(vertical_size + 100, 30)), min(q_len, max(slash_size, 50))
+        last_q = min(64, q_len)
+        last_start = 100
+        qk = torch.einsum(f'bhmk, bhnk -> bhmn', q[:, :, -last_q - last_start:-last_start, :], k) / math.sqrt(self.head_dim)
+        qk[:, :, :, -last_start:] = -torch.inf
+        qk[:, :, :, -last_q - last_start:-last_start] = torch.where(LAST_Q_MASK[..., -last_q:, -last_q:].to(q.device), qk[:, :, :, -last_q - last_start:-last_start], -torch.inf)
+        qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
+        vertical = qk.sum(-2, keepdim=True)
+        vertical[..., :30] = torch.inf
+        vertical[..., -100:] = torch.inf
+        vertical_topk = torch.topk(vertical, vertical_size, -1).indices
+
+        slash = sum_all_diagonal_matrix(qk)[..., :-last_q + 1]
+        slash[..., -100:] = torch.inf
         slash_topk = slash
         slash = (q_len - 1) - torch.topk(slash, slash_size, -1).indices
 
@@ -411,24 +459,26 @@ def gather_last_q_vertical_slash_topk_v4(self, q, k, v, head_id):
         if "vs" in self.__dict__:
             vertical_topk, slash = self.vs
         else:
-            vertical_size, slash_size  = min(q_len, max(vertical_size, 30)), min(q_len, max(slash_size, 50))
+            vertical_size, slash_size = min(q_len, max(vertical_size, 30)), min(q_len, max(slash_size, 50))
             last_q = 64
-            qk = torch.einsum(f'bhmk, bhnk -> bhmn', q[:,:,-last_q:,:], k) / math.sqrt(self.head_dim)
+            qk = torch.einsum(f'bhmk, bhnk -> bhmn', q[:, :, -last_q:, :], k) / math.sqrt(self.head_dim)
             qk[:, :, :, -last_q:] = torch.where(LAST_Q_MASK, qk[:, :, :, -last_q:], -torch.inf)
             qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
             vertical = qk.sum(-2, keepdim=True)
-            vertical[...,:30] = torch.inf
+            vertical[..., :30] = torch.inf
             vertical_topk = torch.topk(vertical, vertical_size, -1).indices
 
-            slash = sum_all_diagonal_matrix(qk)[...,:-last_q + 1]
-            slash[...,-30:] = torch.inf
+            slash = sum_all_diagonal_matrix(qk)[..., :-last_q + 1]
+            slash[..., -30:] = torch.inf
             slash_topk = slash
             slash = (q_len - 1) - torch.topk(slash, slash_size, -1).indices
             self.vs = vertical_topk, slash
 
         return vertical_slash_sparse_attention(q, k, v, vertical_topk, slash)
+
     def dense(q, k, v, vertical_size=None, slash_size=None):
-        return flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1,2), 0.0, softmax_scale=None, causal=q_len != 1).view(bsz, 1, q_len, self.head_dim)
+        return flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), 0.0, softmax_scale=None, causal=q_len != 1).view(bsz, 1, q_len, self.head_dim)
+
     def block_sparse_kernel(q, k, v, vertical_size=None, slash_size=None):
         topk = 100
         return block_sparse_attention(q, k, v, topk)
@@ -455,12 +505,17 @@ def gather_last_q_vertical_slash_topk_v4(self, q, k, v, head_id):
     if self.config.to_dict().get("vs_only", False):
         return vertical_and_slash_kernel(q, k, v, vertical_size, slash_size)
 
-    fc = {
-        "stream_llm": streaming_forward,
-        "vertical_and_slash": vertical_and_slash_kernel,
-        "block_sparse": block_sparse_kernel,
-    }[ty]
-    return fc(q, k, v, vertical_size, slash_size)
+    if cached_k is None:
+        fc = {
+            "stream_llm": streaming_forward,
+            "vertical_and_slash": vertical_and_slash_kernel,
+            "block_sparse": block_sparse_kernel,
+        }[ty]
+        return fc(q, k, v, vertical_size, slash_size)
+    else:
+        vertical_size, slash_size = 100, 512
+        return vertical_and_slash_kernel_cascade(cached_k, cached_v, cached_mask, q, k, v, vertical_size, slash_size)
+
 
 def apply_rotary_pos_emb_single(q, cos, sin, position_ids, unsqueeze_dim=1):
     if len(cos.size()) == 2:
@@ -470,6 +525,7 @@ def apply_rotary_pos_emb_single(q, cos, sin, position_ids, unsqueeze_dim=1):
         cos = cos.unsqueeze(unsqueeze_dim)
         sin = sin.unsqueeze(unsqueeze_dim)
     return (q * cos) + (rotate_half(q) * sin)
+
 
 def minference_forward():
     def forward(
@@ -548,7 +604,7 @@ def minference_forward():
                 if self.layer_idx >= self.starting_layer and not self.is_search:
                     attn_output = self.gather_last_q_vertical_slash_topk_v4(q, k, v, head)
                 elif is_flash_attn_2_available():
-                    attn_output = flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1,2), 0.0, softmax_scale=None, causal=q_len != 1).view(bsz, 1, q_len, self.head_dim)
+                    attn_output = flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), 0.0, softmax_scale=None, causal=q_len != 1).view(bsz, 1, q_len, self.head_dim)
                 else:
                     attn_output = gather_qkv(q, k, v, attention_mask)
                 output[:, head:head + 1] = attn_output
@@ -558,7 +614,7 @@ def minference_forward():
                 with open(self.config_path, 'w') as json_file:
                     json.dump(config_list, json_file)
         else:
-            output =  flash_attn_func(query_states.transpose(1, 2), key_states.transpose(1, 2), value_states.transpose(1,2), 0.0, softmax_scale=None, causal=q_len != 1).view(bsz, query_states.size(1), q_len, self.head_dim)
+            output = flash_attn_func(query_states.transpose(1, 2), key_states.transpose(1, 2), value_states.transpose(1, 2), 0.0, softmax_scale=None, causal=q_len != 1).view(bsz, query_states.size(1), q_len, self.head_dim)
         attn_output = output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
         attn_output = self.o_proj(attn_output)
@@ -566,6 +622,7 @@ def minference_forward():
         return attn_output, None, past_key_value
 
     return forward
+
 
 def minference_kv_cache_cpu_forward():
     def forward(
@@ -648,8 +705,8 @@ def minference_kv_cache_cpu_forward():
                         position_ids = position_ids.to(cos.device)
                     part_k = apply_rotary_pos_emb_single(part_k.transpose(1, 2), cos, sin, position_ids)
                 if use_cache and past_key_value is not None:
-                    k[:,head // self.num_key_value_groups] = part_k.to(kv_cache_cpu_device)
-                    v[:,head // self.num_key_value_groups] = part_v.to(kv_cache_cpu_device)
+                    k[:, head // self.num_key_value_groups] = part_k.to(kv_cache_cpu_device)
+                    v[:, head // self.num_key_value_groups] = part_v.to(kv_cache_cpu_device)
                     part_k, part_v = past_key_value.get(part_k, part_v, self.layer_idx, head // self.num_key_value_groups, cache_kwargs)
 
             if self.layer_idx >= self.starting_layer:
@@ -665,6 +722,206 @@ def minference_kv_cache_cpu_forward():
         return (hidden_states, None, past_key_value)
 
     return forward
+
+
+def apply_rotary_pos_emb_one(x, cos, sin, position_ids=None, unsqueeze_dim=1):
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    x_embed = (x * cos) + (rotate_half(x) * sin)
+    return x_embed
+
+
+def minference_with_cascade_forward():
+    def forward(
+        self,
+        hidden_states,
+        attention_mask,
+        position_ids,
+        past_key_value,
+        output_attentions,
+        use_cache,
+        **kwargs,
+    ):
+        self.init_minference_parameters()
+        self.ne_inf = torch.finfo(hidden_states.dtype).min
+
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        if past_key_value is not None:
+            if self.layer_idx is None:
+                raise ValueError(
+                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
+                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
+                    "with a layer index."
+                )
+
+        set_rope_type(self)
+
+        # 1. get items from cache
+        if not hasattr(self, "last_q_size"):
+            self.last_q_size = None
+
+        first_it = past_key_value.seen_tokens_by_layer[self.layer_idx] == 0
+        sink_key_states, sink_value_states, sink_pos, sink_mask, k_states, v_states, key_pos, key_mask, og_pos =\
+            past_key_value.get_vals(self.layer_idx)
+
+        # 2. do positional encoding
+        max_pos = 0  # may be reset later
+        if first_it:
+            self.query_pos = torch.arange(
+                0, query_states.size(2), device=query_states.device, dtype=torch.long).view(1, -1)
+
+        else:
+            max_pos = torch.cat(
+                (sink_pos.amax().view(1), key_pos.amax().view(1)),
+                dim=-1).amax() + 1
+
+        query_pos = self.query_pos[:, :query_states.size(-2)] + max_pos
+
+        cos_q, sin_q, cos_sink, sin_sink, cos_k, sin_k = (None,) * 6
+        if hasattr(past_key_value, "pos_embeddings") and self.layer_idx != 0:
+            cos_q, sin_q, cos_sink, sin_sink, cos_k, sin_k = \
+                (v for _, v in past_key_value.pos_embeddings.items())
+
+        def rope(x, pos, _cos=None, _sin=None):
+            if _cos is None or _sin is None:
+                _cos, _sin = self.rotary_emb(x, pos)
+
+            out = apply_rotary_pos_emb_one(x, _cos, _sin)
+            return out, _cos, _sin
+
+        query_states, cos_q, sin_q = rope(query_states, query_pos, _cos=cos_q, _sin=sin_q)
+        key_states_pos, _, _ = rope(key_states, query_pos, _cos=cos_q, _sin=sin_q)
+        sink_key_states, cos_sink, sin_sink = rope(sink_key_states, sink_pos, _cos=cos_sink, _sin=sin_sink)
+        k_states, cos_k, sin_k = rope(k_states, key_pos, _cos=cos_k, _sin=sin_k)
+
+        # set the positional embeddings for layer 0 so we don't have to calculate them
+        # for every layer.
+        if self.layer_idx == 0:
+            past_key_value.pos_embeddings = dict(
+                cos_q=cos_q, sin_q=sin_q, cos_sink=cos_sink,
+                sin_sink=sin_sink, cos_k=cos_k, sin_k=sin_k
+            )
+
+        # 3. call minference kernel --> return vertical topk
+        _k_states = torch.cat((sink_key_states, k_states), dim=-2)
+        _v_states = torch.cat((sink_value_states, v_states), dim=-2)
+        cm = torch.cat((sink_mask, key_mask), dim=-1)
+
+        if q_len != 1:
+            if self.layer_idx >= self.starting_layer:
+                # assert query_states.size(1) == key_states_pos.size(1) == value_states_repeat.size(1)
+                output = torch.empty_like(query_states)
+                scores_out = torch.zeros(bsz, self.num_key_value_heads, key_states.size(-2), device=key_states.device, dtype=key_states.dtype)
+                for head in range(query_states.size(1)):
+                    kv_head = head // self.num_key_value_groups
+                    q = query_states[:, head, :, :].unsqueeze(1)
+                    k = key_states_pos[:, kv_head, :, :].unsqueeze(1)
+                    v = value_states[:, kv_head, :, :].unsqueeze(1)
+                    ck = _k_states[:, kv_head, :, :].unsqueeze(1)
+                    cv = _v_states[:, kv_head, :, :].unsqueeze(1)
+                    _cm = cm[0, kv_head]
+
+                    # first it is passed to gather so that it will forcibly retain the sink tokens.
+                    output[:, head:head + 1] = self.gather_last_q_vertical_slash_topk_v4(
+                        q, k, v, head,
+                        cached_k=ck, cached_v=cv, cached_mask=_cm,
+                        scores_out=scores_out, first_it=first_it)
+
+                # 4. gather topk and add to cascading cache
+                if past_key_value is not None:
+                    # if self.last_it:
+                    #     l = 512
+                    #     sparse_scores, dense_scores = scores_out[:, :, :-l], scores_out[:, :, -l:]
+                    #     scores_topk_idx = torch.topk(sparse_scores, key_states.size(2) // 10, dim=-1).indices
+                    #     scores_topk_idx = torch.sort(scores_topk_idx, dim=-1).values
+
+                    #     ckey_states = torch.gather(key_states, -2, scores_topk_idx.unsqueeze(-1).repeat(1, 1, 1, key_states.size(-1)))
+                    #     cvalue_states = torch.gather(value_states, -2, scores_topk_idx.unsqueeze(-1).repeat(1, 1, 1, key_states.size(-1)))
+                    #     cscores = torch.gather(scores_out, -1, scores_topk_idx)
+
+                    #     ckey_states = torch.cat((ckey_states, key_states[:, :, -l:]), dim=-2)
+                    #     cvalue_states = torch.cat((cvalue_states, value_states[:, :, -l:]), dim=-2)
+                    #     cscores = torch.cat((cscores, dense_scores), dim=-1)
+                    # else:
+                    #     scores_topk_idx = torch.topk(scores_out, key_states.size(2) // 10, dim=-1).indices
+                    #     scores_topk_idx = torch.sort(scores_topk_idx, dim=-1).values
+
+                    #     ckey_states = torch.gather(key_states, -2, scores_topk_idx.unsqueeze(-1).repeat(1, 1, 1, key_states.size(-1)))
+                    #     cvalue_states = torch.gather(value_states, -2, scores_topk_idx.unsqueeze(-1).repeat(1, 1, 1, key_states.size(-1)))
+                    #     cscores = torch.gather(scores_out, -1, scores_topk_idx)
+
+                    # print(f"{scores_out=}")
+                    ckey_states = key_states
+                    cvalue_states = value_states
+                    cscores = scores_out
+
+                    _ = past_key_value.update(
+                        ckey_states, cvalue_states, self.layer_idx, score_states=cscores)
+
+            else:
+                raise NotImplementedError("all layers should be minference")
+        else:
+            # =================================================
+            key_states_pos = repeat_kv(key_states_pos, self.num_key_value_groups)
+            sink_key_states = repeat_kv(sink_key_states, self.num_key_value_groups)
+            sink_value_states = repeat_kv(sink_value_states, self.num_key_value_groups)
+            k_states = repeat_kv(k_states, self.num_key_value_groups)
+            v_states = repeat_kv(v_states, self.num_key_value_groups)
+
+            val = torch.finfo(query_states.dtype).min
+            scale = 1 / np.sqrt(query_states.size(-1))
+            qattn = torch.einsum("bhqd,bhkd->bhqk", query_states * np.sqrt(scale), key_states_pos * np.sqrt(scale))
+
+            sattn = torch.einsum("bhqd,bhkd->bhqk", query_states * np.sqrt(scale), sink_key_states * np.sqrt(scale))
+            sattn = sattn + (val * sink_mask[:1, :1, None, :]).to(qattn.dtype)
+
+            cattn = torch.einsum("bhqd,bhkd->bhqk", query_states * np.sqrt(scale), k_states * np.sqrt(scale))
+            cattn = cattn + (val * key_mask[:1, :1, None, :]).to(qattn.dtype)
+
+            attn = torch.cat((sattn, cattn, qattn), dim=-1)
+            attn = attn.softmax(dim=-1)
+
+            sk, k = sink_key_states.size(2), k_states.size(2)
+            output = attn[:, :, :, :sk] @ sink_value_states
+            output += attn[:, :, :, sk:sk + k] @ v_states
+            output += attn[:, :, :, -q_len:] @ repeat_kv(value_states, self.num_key_value_groups)
+
+            scores = attn[:, :, 0, sk:]
+
+            kvh = self.num_key_value_heads
+            b, h, s = scores.size()
+            scores = torch.amax(scores.view(bsz, kvh, h // kvh, -1), dim=2)
+            scores, new_scores = scores[..., :-1], scores[..., -1:]
+
+            beta = 0.999
+            past_key_value.score_cache[self.layer_idx] = \
+                beta * past_key_value.score_cache[self.layer_idx] \
+                + (1 - beta) * scores
+
+            _ = past_key_value.update(
+                key_states,
+                value_states,
+                self.layer_idx,
+                score_states=new_scores,
+            )
+            # ===============================================
+
+        attn_output = output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
+        attn_output = self.o_proj(attn_output)
+        return attn_output, None, past_key_value
+
+    return forward
+
 
 def minference_with_snapkv_forward():
     def forward(
@@ -701,7 +958,7 @@ def minference_with_snapkv_forward():
                     "with a layer index."
                 )
 
-            if hasattr(self, "kv_seq_len"): #[SnapKV] add kv_seq_len
+            if hasattr(self, "kv_seq_len"):  # [SnapKV] add kv_seq_len
                 if self.kv_seq_len != 0:
                     kv_seq_len += self.kv_seq_len
                 else:
@@ -724,8 +981,8 @@ def minference_with_snapkv_forward():
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            if key_states.shape[-2] == kv_seq_len: # [SnapKV] add kv_cluster
-                self.kv_seq_len = kv_seq_len # [SnapKV] register kv_seq_len
+            if key_states.shape[-2] == kv_seq_len:  # [SnapKV] add kv_cluster
+                self.kv_seq_len = kv_seq_len  # [SnapKV] register kv_seq_len
                 key_states_compress, value_states_compress = self.kv_cluster.update_kv(key_states, query_states, value_states, attention_mask, self.num_key_value_groups)
                 past_key_value.update(key_states_compress, value_states_compress, self.layer_idx, cache_kwargs)
             else:
@@ -753,7 +1010,7 @@ def minference_with_snapkv_forward():
                 k = key_states[:, head, :, :].unsqueeze(1)
                 v = value_states[:, head, :, :].unsqueeze(1)
                 if is_flash_attn_2_available():
-                    attn_output = flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1,2), 0.0, softmax_scale=None, causal=q_len != 1).view(bsz, 1, q.shape[2], self.head_dim)
+                    attn_output = flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), 0.0, softmax_scale=None, causal=q_len != 1).view(bsz, 1, q.shape[2], self.head_dim)
                 else:
                     attn_output = gather_qkv(q, k, v, attention_mask)
                 output[:, head:head + 1] = attn_output
@@ -765,23 +1022,24 @@ def minference_with_snapkv_forward():
 
     return forward
 
+
 def gather_last_q_vertical_slash_topk_vllm(self, q, k, v, head_id):
     kv_seq_len = k.size(2)
     head_dim = q.size(-1)
 
     def vertical_and_slash_kernel(q, k, v, vertical_size, slash_size):
-        vertical_size, slash_size  = min(q_len, max(vertical_size, 30)), min(q_len, max(slash_size, 50))
+        vertical_size, slash_size = min(q_len, max(vertical_size, 30)), min(q_len, max(slash_size, 50))
         last_q = min(64, q_len)
-        qk = torch.einsum(f'bhmk, bhnk -> bhmn', q[:,:,-last_q:,:], k)
+        qk = torch.einsum(f'bhmk, bhnk -> bhmn', q[:, :, -last_q:, :], k)
 
-        qk[:, :, :, -last_q:] = torch.where(LAST_Q_MASK[...,-last_q:,-last_q:], qk[:, :, :, -last_q:], -torch.inf)
+        qk[:, :, :, -last_q:] = torch.where(LAST_Q_MASK[..., -last_q:, -last_q:], qk[:, :, :, -last_q:], -torch.inf)
         qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
         vertical = qk.sum(-2, keepdim=True)
-        vertical[...,:30] = torch.inf
+        vertical[..., :30] = torch.inf
         vertical_topk = torch.topk(vertical, vertical_size, -1).indices
 
-        slash = sum_all_diagonal_matrix(qk)[...,:-last_q + 1]
-        slash[...,-100:] = torch.inf
+        slash = sum_all_diagonal_matrix(qk)[..., :-last_q + 1]
+        slash[..., -100:] = torch.inf
         slash_topk = slash
         slash = (q_len - 1) - torch.topk(slash, slash_size, -1).indices
 
@@ -792,7 +1050,7 @@ def gather_last_q_vertical_slash_topk_vllm(self, q, k, v, head_id):
         return block_sparse_attention(q, k, v, topk)
 
     def dense(q, k, v, vertical_size=None, slash_size=None):
-        return flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1,2), 0.0, softmax_scale=None, causal=q_len != 1).view(bsz, 1, q_len, head_dim)
+        return flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), 0.0, softmax_scale=None, causal=q_len != 1).view(bsz, 1, q_len, head_dim)
 
     q_len = q.shape[2]
     bsz = q.shape[0]
@@ -809,9 +1067,10 @@ def gather_last_q_vertical_slash_topk_vllm(self, q, k, v, head_id):
     }[ty]
     return fc(q, k, v, vertical_size, slash_size)
 
+
 def minference_vllm_forward(
     pattern_config,
-    vllm_version = "0.4.1"
+    vllm_version="0.4.1"
 ):
     def forward(
         self,
@@ -835,6 +1094,7 @@ def minference_vllm_forward(
             shape = [num_tokens, num_heads * head_size]
         """
         self.best_pattern = {int(ii): jj for ii, jj in pattern_config[layer_idx].items()}
+
         def repeat_kv(hidden_states, n_rep):
             sqlen, num_head, head_dim = hidden_states.shape
             if n_rep == 1:
@@ -868,7 +1128,7 @@ def minference_vllm_forward(
                 out = self.gather_last_q_vertical_slash_topk_vllm(q_head, k_head, v_head, head)
 
                 out = out.transpose(1, 2).squeeze(0).contiguous()
-                output[:, head:head+1, :] = out
+                output[:, head:head + 1, :] = out
             return output
 
         num_tokens, hidden_size = query.shape
@@ -988,6 +1248,7 @@ def minference_vllm_forward(
             shape = [num_tokens, num_heads * head_size]
         """
         self.best_pattern = {int(ii): jj for ii, jj in pattern_config[layer_idx].items()}
+
         def repeat_kv(hidden_states, n_rep):
             sqlen, num_head, head_dim = hidden_states.shape
             if n_rep == 1:
@@ -1021,7 +1282,7 @@ def minference_vllm_forward(
                 out = self.gather_last_q_vertical_slash_topk_vllm(q_head, k_head, v_head, head)
 
                 out = out.transpose(1, 2).squeeze(0).contiguous()
-                output[:, head:head+1, :] = out
+                output[:, head:head + 1, :] = out
             return output
 
         num_tokens, hidden_size = query.shape
@@ -1177,7 +1438,7 @@ def minference_vllm_forward(
                 out = self.gather_last_q_vertical_slash_topk_vllm(q_head, k_head, v_head, head)
 
                 out = out.transpose(1, 2).squeeze(0).contiguous()
-                output[:, head:head+1, :] = out
+                output[:, head:head + 1, :] = out
             return output
 
         num_tokens, hidden_size = query.shape

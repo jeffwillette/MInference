@@ -17,6 +17,7 @@ from .modules.minference_forward import (
     minference_kv_cache_cpu_forward,
     minference_vllm_forward,
     minference_with_snapkv_forward,
+    minference_with_cascade_forward,
     search_pattern,
     sum_all_diagonal_matrix,
 )
@@ -63,17 +64,17 @@ class RotaryEmbeddingESM(torch.nn.Module):
     def apply_rotary_pos_emb(self, x, length, right, cos, sin):
         dtype = x.dtype
         if self.is_glm4:
-            cos = cos[right - length : right, ...]
+            cos = cos[right - length: right, ...]
             return apply_rotary_pos_emb_glm4(x, cos)
         if cos.dim() == 2:
-            cos = cos[right - length : right, :]
-            sin = sin[right - length : right, :]
+            cos = cos[right - length: right, :]
+            sin = sin[right - length: right, :]
         elif cos.dim() == 3:
-            cos = cos[:, right - length : right, :]
-            sin = sin[:, right - length : right, :]
+            cos = cos[:, right - length: right, :]
+            sin = sin[:, right - length: right, :]
         elif cos.dim() == 4:
-            cos = cos[:, :, right - length : right, :]
-            sin = sin[:, :, right - length : right, :]
+            cos = cos[:, :, right - length: right, :]
+            sin = sin[:, :, right - length: right, :]
 
         if cos.device != x.device:
             cos, sin = cos.to(x.device), sin.to(x.device)
@@ -138,14 +139,14 @@ class RotaryEmbeddingESM(torch.nn.Module):
         if self.is_glm4:
             return apply_rotary_pos_emb_glm4(x, cos)
         if cos.dim() == 2:
-            cos = cos[index - 1 : index, :]
-            sin = sin[index - 1 : index, :]
+            cos = cos[index - 1: index, :]
+            sin = sin[index - 1: index, :]
         elif cos.dim() == 3:
-            cos = cos[:, index - 1 : index, :]
-            sin = sin[:, index - 1 : index, :]
+            cos = cos[:, index - 1: index, :]
+            sin = sin[:, index - 1: index, :]
         elif cos.dim() == 4:
-            cos = cos[:, :, index - 1 : index, :]
-            sin = sin[:, :, index - 1 : index, :]
+            cos = cos[:, :, index - 1: index, :]
+            sin = sin[:, :, index - 1: index, :]
 
         if cos.device != x.device:
             cos, sin = cos.to(x.device), sin.to(x.device)
@@ -237,17 +238,17 @@ def huggingface_forward(forward):
 
             self.q_proj.weight.copy_(self.qkv_proj.weight[:query_pos, :])
             self.k_proj.weight.copy_(
-                self.qkv_proj.weight[query_pos : query_pos + key_value_pos, :]
+                self.qkv_proj.weight[query_pos: query_pos + key_value_pos, :]
             )
             self.v_proj.weight.copy_(
-                self.qkv_proj.weight[query_pos + key_value_pos :, :]
+                self.qkv_proj.weight[query_pos + key_value_pos:, :]
             )
 
             self.q_proj.bias.copy_(self.qkv_proj.bias[:query_pos])
             self.k_proj.bias.copy_(
-                self.qkv_proj.bias[query_pos : query_pos + key_value_pos]
+                self.qkv_proj.bias[query_pos: query_pos + key_value_pos]
             )
-            self.v_proj.bias.copy_(self.qkv_proj.bias[query_pos + key_value_pos :])
+            self.v_proj.bias.copy_(self.qkv_proj.bias[query_pos + key_value_pos:])
 
             del self.qkv_proj
 
@@ -299,7 +300,7 @@ def hf_437_prepare_inputs_for_generation(
         # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as
         # input)
         if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
-            input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+            input_ids = input_ids[:, -(attention_mask.shape[1] - past_length):]
         # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
         # input_ids based on the past_length.
         elif past_length < input_ids.shape[1]:
@@ -320,7 +321,7 @@ def hf_437_prepare_inputs_for_generation(
         position_ids = attention_mask.long().cumsum(-1) - 1
         position_ids.masked_fill_(attention_mask == 0, 1)
         if past_key_values:
-            position_ids = position_ids[:, -input_ids.shape[1] :]
+            position_ids = position_ids[:, -input_ids.shape[1]:]
 
     # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
     if inputs_embeds is not None and past_key_values is None:
@@ -386,7 +387,7 @@ def prepare_inputs_for_generation(
         # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as
         # input)
         if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
-            input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+            input_ids = input_ids[:, -(attention_mask.shape[1] - past_length):]
         # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
         # input_ids based on the past_length.
         elif past_length < input_ids.shape[1]:
@@ -407,7 +408,7 @@ def prepare_inputs_for_generation(
         position_ids = attention_mask.long().cumsum(-1) - 1
         position_ids.masked_fill_(attention_mask == 0, 1)
         if past_key_values:
-            position_ids = position_ids[:, -input_ids.shape[1] :]
+            position_ids = position_ids[:, -input_ids.shape[1]:]
 
     # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
     if inputs_embeds is not None and past_key_values is None:
@@ -469,7 +470,7 @@ def prepare_inputs_for_generation_snapkv(
         # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as
         # input)
         if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
-            input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+            input_ids = input_ids[:, -(attention_mask.shape[1] - past_length):]
         # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
         # input_ids based on the past_length.
         elif past_length < input_ids.shape[1]:
@@ -490,7 +491,7 @@ def prepare_inputs_for_generation_snapkv(
         position_ids = attention_mask.long().cumsum(-1) - 1
         position_ids.masked_fill_(attention_mask == 0, 1)
         if past_key_values:
-            position_ids = position_ids[:, -input_ids.shape[1] :]
+            position_ids = position_ids[:, -input_ids.shape[1]:]
 
     # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
     if inputs_embeds is not None and past_key_values is None:
@@ -770,6 +771,7 @@ def forward_llama_for_causal_lm(
     output_attentions: Optional[bool] = None,
     output_hidden_states: Optional[bool] = None,
     return_dict: Optional[bool] = None,
+    cache_position: Optional[torch.LongTensor] = None,
 ) -> Union[Tuple, CausalLMOutputWithPast]:
     # assert labels is not None
     output_attentions = (
@@ -813,7 +815,7 @@ def forward_llama_for_causal_lm(
             shift_logits = self.lm_head(
                 hidden_states[..., start_idx:end_idx, :]
             ).float()
-            shift_labels = labels[..., start_idx + 1 : end_idx + 1].contiguous()
+            shift_labels = labels[..., start_idx + 1: end_idx + 1].contiguous()
             # Flatten the tokens
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
@@ -847,6 +849,8 @@ def minference_patch(model, config):
         return minference_patch_kv_cache_cpu(model)
     if config.use_snapkv:
         return minference_patch_with_snapkv(model)
+    elif config.use_cascade:
+        return minference_patch_with_cascade(model)
 
     model = patch_glm_4_1m(model)
 
@@ -931,6 +935,49 @@ def minference_patch_kv_cache_cpu(model):
     model.forward = forward_llama_for_causal_lm.__get__(model, model.__class__)
 
     print("Patched model for MInference load KV Cache to CPU.")
+    return model
+
+
+def minference_patch_with_cascade(model):
+    from transformers import LlamaForCausalLM
+
+    model = patch_glm_4_1m(model)
+
+    Attention = model.model.layers[0].self_attn.__class__
+    Model = model.model.__class__
+    DecoderLayer = model.model.layers[0].__class__
+
+    forward = minference_with_cascade_forward()
+
+    def update_module(m):
+        if isinstance(m, Attention):
+            m.init_minference_parameters = init_minference_parameters.__get__(
+                m, Attention
+            )
+            m.gather_last_q_vertical_slash_topk_v4 = (
+                gather_last_q_vertical_slash_topk_v4.__get__(m, Attention)
+            )
+            m.forward = forward.__get__(m, Attention)
+        if isinstance(m, DecoderLayer):
+            m.forward = forward_llama_decoder_layer.__get__(m, DecoderLayer)
+
+    model.apply(update_module)
+    model.prepare_inputs_for_generation = prepare_inputs_for_generation.__get__(
+        model, model.__class__
+    )
+    model.model._use_sdpa = False
+
+    model.model._prepare_decoder_attention_mask = (
+        _prepare_decoder_attention_mask_inference.__get__(
+            model.model, model.model.__class__
+        )
+    )
+    model.model.forward = forward_llama_model.__get__(
+        model.model, model.model.__class__
+    )
+    model.forward = forward_llama_for_causal_lm.__get__(model, model.__class__)
+
+    print("Patched model for minference with SanpKV..")
     return model
 
 
@@ -1415,24 +1462,24 @@ def cpu_cache_get(
         return key_states, value_states
     elif KV_CACHE_CPU_DEVICE == "cpu":
         key_states = torch.cat(
-            [self.key_cache[layer_idx][:, head_idx : head_idx + 1].cuda(), key_states],
+            [self.key_cache[layer_idx][:, head_idx: head_idx + 1].cuda(), key_states],
             dim=-2,
         )
         value_states = torch.cat(
             [
-                self.value_cache[layer_idx][:, head_idx : head_idx + 1].cuda(),
+                self.value_cache[layer_idx][:, head_idx: head_idx + 1].cuda(),
                 value_states,
             ],
             dim=-2,
         )
         return key_states, value_states
     key_states = torch.cat(
-        [self.key_cache[layer_idx][:, head_idx : head_idx + 1], key_states],
+        [self.key_cache[layer_idx][:, head_idx: head_idx + 1], key_states],
         dim=-2,
     )
     value_states = torch.cat(
         [
-            self.value_cache[layer_idx][:, head_idx : head_idx + 1],
+            self.value_cache[layer_idx][:, head_idx: head_idx + 1],
             value_states,
         ],
         dim=-2,

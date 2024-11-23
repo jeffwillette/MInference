@@ -23,6 +23,7 @@ __all__ = [
     "minference_patch",
     "minference_patch_kv_cache_cpu",
     "minference_patch_with_snapkv",
+    "minference_patch_with_cascade",
     "patch_hf",
     "vertical_slash_sparse_attention",
     "block_sparse_attention",

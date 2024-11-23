@@ -25,8 +25,19 @@ from minference.cuda import convert_vertical_slash_indexes
 #    ],
 #    key=['N_CTX'],
 # )
+
+
 @triton.jit
 def _triton_mixed_sparse_attn_fwd_kernel(
+    CK,
+    stride_ckz, stride_ckh, stride_ckn, stride_ckk,
+    CV,
+    stride_cvz, stride_cvh, stride_cvn, stride_cvk,
+    N_CKV,
+    MASK,
+    stride_mm, stride_mn,
+    SCORES,
+    stride_sz, stride_sh, stride_sn,  # original args
     Q, K, V, seqlens, sm_scale,
     block_count, block_offset, column_count, column_index,
     Out,
@@ -81,6 +92,101 @@ def _triton_mixed_sparse_attn_fwd_kernel(
     # loop over k, v and update accumulator
     m_mask = offs_m[:, None] < seqlen
 
+    # copied in from the cascade flash attention kernel. =================
+    tl.static_assert(BLOCK_N <= BLOCK_DMODEL)
+    off_z = off_hz // H
+    off_h = off_hz % H
+
+    ckv_offset = off_z.to(tl.int64) * stride_ckz + off_h.to(tl.int64) * stride_ckh
+    score_offset = off_z.to(tl.int64) * stride_sz + off_h.to(
+        tl.int64) * stride_sh
+
+    # block pointers
+    CV_block_ptr = tl.make_block_ptr(
+        base=CV + ckv_offset,
+        shape=(N_CKV, BLOCK_DMODEL),
+        strides=(stride_cvk, stride_cvn),
+        offsets=(0, 0),
+        block_shape=(BLOCK_N, BLOCK_DMODEL),
+        order=(0 if V.dtype.element_ty == tl.float8e5 else 1,
+               1 if V.dtype.element_ty == tl.float8e5 else 0),
+    )
+
+    CK_block_ptr = tl.make_block_ptr(
+        base=CK + ckv_offset,
+        shape=(BLOCK_DMODEL, N_CKV),
+        strides=(stride_ckk, stride_ckn),
+        offsets=(0, 0),
+        block_shape=(BLOCK_DMODEL, BLOCK_N),
+        order=(0, 1),
+    )
+
+    CK_block_ptr = tl.advance(CK_block_ptr, (0, 0))
+    CV_block_ptr = tl.advance(CV_block_ptr, (0, 0))
+
+    Mask_block = offs_n * stride_mn
+    beta = 0.999
+
+    # loop over k, v and update accumulator
+    mask_vert = tl.full((BLOCK_M, 1), value=1, dtype=tl.int1)
+    for start_n in range(0, N_CKV, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        # -- compute qk ----
+        k = tl.load(CK_block_ptr)
+
+        # load from the cache mask (sink, keyvals)
+        mask = (mask_vert * \
+                tl.load(MASK + Mask_block)[None, :].to(tl.int1)).to(tl.int1)
+
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        qk += tl.dot(q, k)
+        qk += tl.where(mask, -1.0e6, 0)
+
+        # ------------------------------
+        # for sum accumulation
+        # coeff = 1
+
+        # for EMA accumulation
+        exps = tl.flip(tl.arange(0, BLOCK_M))[:, None]  # original submission
+        # exps = N_CTX - (start_m * tl.flip(tl.arange(0, BLOCK_M))[:, None])  # bugfix?
+        unmasked = tl.where(mask, 0, 1)
+        exps = tl.exp2(exps.to(dtype) * tl.log2(beta))
+        coeff = exps * (1 - beta) * unmasked
+        # ------------------------------
+
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        qk -= m_ij[:, None]
+        p = tl.math.exp2(qk)
+        l_ij = tl.sum(p, 1)
+
+        # -- update m_i and l_i
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + l_ij
+
+        # this will be incrementally more accurate as we get to the end of the sequence.
+        # it is not exactly equivalent to the non-flash attention version.
+        # print("qk term: ", tl.sum((p / l_ij[:, None])))
+        # print("coeff term: ", coeff)
+        steps_left = (N_CKV - (start_n + BLOCK_N)) // BLOCK_N
+        steps_done = (start_n + BLOCK_N) // BLOCK_N
+        adj = steps_left / steps_done
+        # print("adj: ", adj)
+        score_offset_inner = (start_n + tl.arange(0, BLOCK_N)).to(tl.int64) * stride_sn
+        tl.atomic_add(SCORES + score_offset + score_offset_inner, val=tl.sum((p / (l_i[:, None] + (l_i[:, None] * adj) + 1e-6)) * coeff, 0))
+
+        # -- update output accumulator --
+        acc = acc * alpha[:, None]
+        # update acc
+        v = tl.load(CV_block_ptr)
+
+        acc += tl.dot(p.to(dtype), v)
+        # update m_i and l_i
+        m_i = m_ij
+
+        CV_block_ptr = tl.advance(CV_block_ptr, (BLOCK_N, 0))
+        CK_block_ptr = tl.advance(CK_block_ptr, (0, BLOCK_N))
+        Mask_block += BLOCK_N * stride_mn
+
     for block_index in range(num_blks):
         start_n = tl.load(blks_ptr + block_index)
         cols = start_n + offs_n
@@ -134,6 +240,9 @@ def _triton_mixed_sparse_attn_fwd_kernel(
 
 
 def _triton_mixed_sparse_attention(
+    ck: torch.Tensor,
+    cv: torch.Tensor,
+    cmask: torch.Tensor,
     q: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
     k: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
     v: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
@@ -153,7 +262,24 @@ def _triton_mixed_sparse_attention(
     o = torch.zeros_like(q)
     grid = (triton.cdiv(q.shape[2], block_size_M), q.shape[0] * q.shape[1], 1)
     dtype = tl.bfloat16 if q.dtype == torch.bfloat16 else tl.float16
+
+    N_CKV = ck.size(2)
+    scores = torch.zeros(q.size(0),
+                         q.size(1),
+                         ck.size(-2),
+                         device=q.device,
+                         dtype=q.dtype)
+
     _triton_mixed_sparse_attn_fwd_kernel[grid](
+        ck,
+        ck.stride(0), ck.stride(1), ck.stride(2), ck.stride(3),
+        cv,
+        cv.stride(0), cv.stride(1), cv.stride(2), cv.stride(3),
+        N_CKV,
+        cmask,
+        cmask.stride(0), cmask.stride(1),
+        scores,
+        scores.stride(0), scores.stride(1), scores.stride(2),
         q, k, v, seqlens, sm_scale,
         block_count, block_offset, column_count, column_index,
         o,
@@ -172,7 +298,10 @@ def _triton_mixed_sparse_attention(
     return o
 
 
-def vertical_slash_sparse_attention(
+def vertical_slash_sparse_attention_cascade(
+    ck: torch.Tensor,
+    cv: torch.Tensor,
+    cmask: torch.Tensor,
     query: torch.Tensor,  # [BATCH, N_HEADS, N_CTX, D_HEAD]
     key: torch.Tensor,    # [BATCH, N_HEADS, N_CTX, D_HEAD]
     value: torch.Tensor,  # [BATCH, N_HEADS, N_CTX, D_HEAD]
@@ -200,7 +329,11 @@ def vertical_slash_sparse_attention(
     block_count, block_offset, column_count, column_index = convert_vertical_slash_indexes(
         seqlens, v_idx, s_idx, context_size, block_size_M, block_size_N,
     )
+
+    cmask = cmask[None, :].contiguous()
+    assert len(cmask.shape) == 2
     out = _triton_mixed_sparse_attention(
+        ck, cv, cmask,
         query, key, value, seqlens,
         block_count, block_offset, column_count, column_index,
         sm_scale, block_size_M, block_size_N,
@@ -218,8 +351,11 @@ if __name__ == "__main__":
     SEARCH_MASK = None
 
     print("testing vertical slash sparse cascade")
-    NQ, NKV, D = 8192, 8192, 128
-    N_VIDX, N_SIDX = 1000, 6096
+    NQ, NKV, D = 8192, 8192, 64
+    N_VIDX, N_SIDX = 200, 200
+    ck = torch.randn(1, 32, NKV, D).to(torch.float16).cuda()
+    cv = torch.randn(1, 32, NKV, D).to(torch.float16).cuda()
+    cmask = torch.rand(10, NKV).cuda() > 0.5
 
     q = torch.randn(1, 32, NQ, D).to(torch.float16).cuda()
     k = torch.randn(1, 32, NKV, D).to(torch.float16).cuda()
@@ -230,6 +366,8 @@ if __name__ == "__main__":
         _q = q[:, head, :, :].unsqueeze(1)
         _k = k[:, head, :, :].unsqueeze(1)
         _v = v[:, head, :, :].unsqueeze(1)
+        _ck = ck[:, head, :, :].unsqueeze(1)
+        _cv = cv[:, head, :, :].unsqueeze(1)
 
         vertical_size, slash_size = min(NQ, max(N_VIDX, 30)), min(NQ, max(N_SIDX, 50))
         last_q = min(64, NQ // 2)
@@ -253,6 +391,7 @@ if __name__ == "__main__":
         slash_topk = slash
         slash = (NQ - 1) - torch.topk(slash, slash_size, -1).indices
 
-        attn_output = vertical_slash_sparse_attention(_q, _k, _v, vertical_topk, slash)
+        attn_output = vertical_slash_sparse_attention(_ck, _cv, cmask, _q, _k, _v, vertical_topk, slash)
         output[:, head:head + 1] = attn_output
+
     print(output.size())
