@@ -7,8 +7,13 @@ import numpy as np
 import os
 import warnings
 from importlib import import_module
+import math
 
-from transformers.models.llama.modeling_llama import *
+# from transformers.models.llama.modeling_llama import *
+from transformers.models.llama.modeling_llama import repeat_kv, rotate_half
+import torch
+from torch import nn
+from torch.nn import functional as F
 from transformers.utils import is_flash_attn_2_available
 from transformers.utils.import_utils import _is_package_available
 
@@ -393,7 +398,7 @@ def gather_last_q_vertical_slash_topk_v4(
     def vertical_and_slash_kernel(q, k, v, vertical_size, slash_size):
         vertical_size, slash_size = min(q_len, max(vertical_size, 30)), min(q_len, max(slash_size, 50))
         last_q = min(64, q_len)
-        qk = torch.einsum(f'bhmk, bhnk -> bhmn', q[:, :, -last_q:, :], k) / math.sqrt(self.head_dim)
+        qk = torch.einsum('bhmk, bhnk -> bhmn', q[:, :, -last_q:, :], k) / math.sqrt(self.head_dim)
         qk[:, :, :, -last_q:] = torch.where(LAST_Q_MASK[..., -last_q:, -last_q:].to(q.device), qk[:, :, :, -last_q:], -torch.inf)
         qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
         vertical = qk.sum(-2, keepdim=True)
@@ -410,13 +415,32 @@ def gather_last_q_vertical_slash_topk_v4(
     def vertical_and_slash_kernel_cascade(ck, cv, cm, q, k, v, vertical_size, slash_size):
         vertical_size, slash_size = min(q_len, max(vertical_size, 30)), min(q_len, max(slash_size, 50))
         last_q = min(64, q_len)
-        qk = torch.einsum(f'bhmk, bhnk -> bhmn', q[:, :, -last_q:, :], k) / math.sqrt(self.head_dim)
-        qk[:, :, :, -last_q:] = torch.where(LAST_Q_MASK[..., -last_q:, -last_q:].to(q.device), qk[:, :, :, -last_q:], -torch.inf)
-        qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
-        vertical = qk.sum(-2, keepdim=True)
 
         if first_it:
+            qk = torch.einsum('bhmk, bhnk -> bhmn', q[:, :, -last_q:, :], k) / math.sqrt(self.head_dim)
+            qk[:, :, :, -last_q:] = torch.where(LAST_Q_MASK[..., -last_q:, -last_q:].to(q.device), qk[:, :, :, -last_q:], -torch.inf)
+            qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
+
+            c = torch.cat((
+                torch.full((qk.size(-1) - last_q,), last_q, device=qk.device, dtype=torch.long),
+                torch.flip(torch.arange(1, last_q + 1, device=qk.device, dtype=qk.dtype), dims=(0,))
+            )).view(1, 1, 1, -1)
+
+            vertical = qk.sum(-2, keepdim=True) / c
             vertical[..., :64] = torch.inf
+        else:
+            _k = torch.cat((ck[:, :, :64], k), dim=2)
+            qk = torch.einsum('bhmk, bhnk -> bhmn', q[:, :, -last_q:, :], _k) / math.sqrt(self.head_dim)
+            qk[:, :, :, -last_q:] = torch.where(LAST_Q_MASK[..., -last_q:, -last_q:].to(q.device), qk[:, :, :, -last_q:], -torch.inf)
+            qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
+            qk = qk[:, :, :, 64:]
+
+            c = torch.cat((
+                torch.full((qk.size(-1) - last_q,), last_q, device=qk.device, dtype=torch.long),
+                torch.flip(torch.arange(1, last_q + 1, device=qk.device, dtype=qk.dtype), dims=(0,))
+            )).view(1, 1, 1, -1)
+
+            vertical = qk.sum(-2, keepdim=True) / c
 
         vertical_topk = torch.topk(vertical, vertical_size, -1).indices
 
@@ -513,7 +537,7 @@ def gather_last_q_vertical_slash_topk_v4(
         }[ty]
         return fc(q, k, v, vertical_size, slash_size)
     else:
-        vertical_size, slash_size = 100, 512
+        # vertical_size, slash_size = 1000, 6096
         return vertical_and_slash_kernel_cascade(cached_k, cached_v, cached_mask, q, k, v, vertical_size, slash_size)
 
 
@@ -798,6 +822,9 @@ def minference_with_cascade_forward():
             out = apply_rotary_pos_emb_one(x, _cos, _sin)
             return out, _cos, _sin
 
+        # print(f"{key_pos=} {key_pos.amin()=} {key_pos.amax()=}")
+        # print(f"{sink_pos=} {sink_pos.amin()=} {sink_pos.amax()=}")
+        # print(f"{query_pos=}")
         query_states, cos_q, sin_q = rope(query_states, query_pos, _cos=cos_q, _sin=sin_q)
         key_states_pos, _, _ = rope(key_states, query_pos, _cos=cos_q, _sin=sin_q)
         sink_key_states, cos_sink, sin_sink = rope(sink_key_states, sink_pos, _cos=cos_sink, _sin=sin_sink)
@@ -826,6 +853,7 @@ def minference_with_cascade_forward():
                     q = query_states[:, head, :, :].unsqueeze(1)
                     k = key_states_pos[:, kv_head, :, :].unsqueeze(1)
                     v = value_states[:, kv_head, :, :].unsqueeze(1)
+
                     ck = _k_states[:, kv_head, :, :].unsqueeze(1)
                     cv = _v_states[:, kv_head, :, :].unsqueeze(1)
                     _cm = cm[0, kv_head]
@@ -837,35 +865,46 @@ def minference_with_cascade_forward():
                         scores_out=scores_out, first_it=first_it)
 
                 # 4. gather topk and add to cascading cache
-                if past_key_value is not None:
-                    # if self.last_it:
-                    #     l = 512
-                    #     sparse_scores, dense_scores = scores_out[:, :, :-l], scores_out[:, :, -l:]
-                    #     scores_topk_idx = torch.topk(sparse_scores, key_states.size(2) // 10, dim=-1).indices
-                    #     scores_topk_idx = torch.sort(scores_topk_idx, dim=-1).values
+                k = key_states.size(2) // 10
+                if self.last_it:
+                    l = 1024
+                    sparse_scores, dense_scores = scores_out[:, :, :-l], scores_out[:, :, -l:]
 
-                    #     ckey_states = torch.gather(key_states, -2, scores_topk_idx.unsqueeze(-1).repeat(1, 1, 1, key_states.size(-1)))
-                    #     cvalue_states = torch.gather(value_states, -2, scores_topk_idx.unsqueeze(-1).repeat(1, 1, 1, key_states.size(-1)))
-                    #     cscores = torch.gather(scores_out, -1, scores_topk_idx)
+                    if sparse_scores.size(2) > 0:
+                        if k > sparse_scores.size(2):
+                            k = sparse_scores.size(2)
 
-                    #     ckey_states = torch.cat((ckey_states, key_states[:, :, -l:]), dim=-2)
-                    #     cvalue_states = torch.cat((cvalue_states, value_states[:, :, -l:]), dim=-2)
-                    #     cscores = torch.cat((cscores, dense_scores), dim=-1)
-                    # else:
-                    #     scores_topk_idx = torch.topk(scores_out, key_states.size(2) // 10, dim=-1).indices
-                    #     scores_topk_idx = torch.sort(scores_topk_idx, dim=-1).values
+                        scores_topk_idx = torch.topk(sparse_scores, k, dim=-1).indices
+                        scores_topk_idx = torch.sort(scores_topk_idx, dim=-1).values
 
-                    #     ckey_states = torch.gather(key_states, -2, scores_topk_idx.unsqueeze(-1).repeat(1, 1, 1, key_states.size(-1)))
-                    #     cvalue_states = torch.gather(value_states, -2, scores_topk_idx.unsqueeze(-1).repeat(1, 1, 1, key_states.size(-1)))
-                    #     cscores = torch.gather(scores_out, -1, scores_topk_idx)
+                        ckey_states = torch.gather(key_states, -2, scores_topk_idx.unsqueeze(-1).repeat(1, 1, 1, key_states.size(-1)))
+                        cvalue_states = torch.gather(value_states, -2, scores_topk_idx.unsqueeze(-1).repeat(1, 1, 1, key_states.size(-1)))
+                        cscores = torch.gather(scores_out, -1, scores_topk_idx)
+                    else:
+                        ckey_states = key_states
+                        cvalue_states = value_states
+                        cscores = scores_out
 
-                    # print(f"{scores_out=}")
-                    ckey_states = key_states
-                    cvalue_states = value_states
-                    cscores = scores_out
+                    ckey_states = torch.cat((ckey_states, key_states[:, :, -l:]), dim=-2)
+                    cvalue_states = torch.cat((cvalue_states, value_states[:, :, -l:]), dim=-2)
+                    cscores = torch.cat((cscores, dense_scores), dim=-1)
+                else:
+                    scores_topk_idx = torch.topk(scores_out, k, dim=-1).indices
+                    scores_topk_idx = torch.sort(scores_topk_idx, dim=-1).values
 
-                    _ = past_key_value.update(
-                        ckey_states, cvalue_states, self.layer_idx, score_states=cscores)
+                    ckey_states = torch.gather(key_states, -2, scores_topk_idx.unsqueeze(-1).repeat(1, 1, 1, key_states.size(-1)))
+                    cvalue_states = torch.gather(value_states, -2, scores_topk_idx.unsqueeze(-1).repeat(1, 1, 1, key_states.size(-1)))
+                    cscores = torch.gather(scores_out, -1, scores_topk_idx)
+
+                # print(f"{scores_out=}")
+                # ckey_states = key_states
+                # cvalue_states = value_states
+                # cscores = scores_out
+                # print(f"before adding: {ckey_states.dtype=} {cvalue_states.dtype=} {cscores.dtype=}")
+                # print(f"before adding: {ckey_states.size()=} {cvalue_states.size()=} {cscores.size()=}")
+
+                _ = past_key_value.update(
+                    ckey_states, cvalue_states, self.layer_idx, score_states=cscores)
 
             else:
                 raise NotImplementedError("all layers should be minference")

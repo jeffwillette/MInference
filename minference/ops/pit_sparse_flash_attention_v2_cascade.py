@@ -45,7 +45,7 @@ def _triton_mixed_sparse_attn_fwd_kernel(
     stride_kz, stride_kh, stride_kn, stride_kk,
     stride_vz, stride_vh, stride_vn, stride_vk,
     stride_oz, stride_oh, stride_om, stride_ok,
-    Z, H, N_CTX,
+    Z, H, N_CTX: tl.constexpr,
     NUM_ROWS, NNZ_S, NNZ_V,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -97,50 +97,43 @@ def _triton_mixed_sparse_attn_fwd_kernel(
     off_z = off_hz // H
     off_h = off_hz % H
 
-    ckv_offset = off_z.to(tl.int64) * stride_ckz + off_h.to(tl.int64) * stride_ckh
+    ck_offset = off_z.to(tl.int64) * stride_ckz + off_h.to(tl.int64) * stride_ckh
+    cv_offset = off_z.to(tl.int64) * stride_cvz + off_h.to(tl.int64) * stride_cvh
     score_offset = off_z.to(tl.int64) * stride_sz + off_h.to(
         tl.int64) * stride_sh
 
     # block pointers
-    CV_block_ptr = tl.make_block_ptr(
-        base=CV + ckv_offset,
-        shape=(N_CKV, BLOCK_DMODEL),
-        strides=(stride_cvk, stride_cvn),
-        offsets=(0, 0),
-        block_shape=(BLOCK_N, BLOCK_DMODEL),
-        order=(0 if V.dtype.element_ty == tl.float8e5 else 1,
-               1 if V.dtype.element_ty == tl.float8e5 else 0),
-    )
-
-    CK_block_ptr = tl.make_block_ptr(
-        base=CK + ckv_offset,
-        shape=(BLOCK_DMODEL, N_CKV),
-        strides=(stride_ckk, stride_ckn),
-        offsets=(0, 0),
-        block_shape=(BLOCK_DMODEL, BLOCK_N),
-        order=(0, 1),
-    )
-
-    CK_block_ptr = tl.advance(CK_block_ptr, (0, 0))
-    CV_block_ptr = tl.advance(CV_block_ptr, (0, 0))
+    ck_offset = ck_offset + (offs_d[:, None]).to(tl.int64) * stride_ckk
+    cv_offset = cv_offset + (offs_d[None, :]).to(tl.int64) * stride_cvk
 
     Mask_block = offs_n * stride_mn
     beta = 0.999
 
     # loop over k, v and update accumulator
-    mask_vert = tl.full((BLOCK_M, 1), value=1, dtype=tl.int1)
+    # mask_vert = tl.full((BLOCK_M, 1), value=1, dtype=tl.int1)
+    # print("m mask: ", m_mask)
     for start_n in range(0, N_CKV, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
+
+        cols = start_n + offs_n
+        n_mask = cols < N_CKV
+        k = tl.load(CK + ck_offset + cols[None, :] * stride_ckn, mask=n_mask[None, :], other=0.0)
+        v = tl.load(CV + cv_offset + cols[:, None] * stride_cvn, mask=n_mask[:, None], other=0.0)
+
         # -- compute qk ----
-        k = tl.load(CK_block_ptr)
+        # k = tl.load(CK_block_ptr)
 
         # load from the cache mask (sink, keyvals)
-        mask = (mask_vert * \
-                tl.load(MASK + Mask_block)[None, :].to(tl.int1)).to(tl.int1)
+        mask = tl.load(MASK + Mask_block)[None, :]
+        # print("mask: ", mask)
+        mask = tl.where(mask, 0, 1)
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, k)
-        qk += tl.where(mask, -1.0e6, 0)
+        # qk = tl.where(mask, float("-inf"), qk)
+        # qk = tl.where(m_mask & mask, qk, float("-inf"))
+        qk = tl.dot(q, k)
+        # qk += tl.where(mask, -1.0e6, 0)
+        qk += tl.where(m_mask & mask, 0.0, -1.0e6)
 
         # ------------------------------
         # for sum accumulation
@@ -177,15 +170,37 @@ def _triton_mixed_sparse_attn_fwd_kernel(
         # -- update output accumulator --
         acc = acc * alpha[:, None]
         # update acc
-        v = tl.load(CV_block_ptr)
+        # v = tl.load(CV_block_ptr)
 
         acc += tl.dot(p.to(dtype), v)
         # update m_i and l_i
         m_i = m_ij
 
-        CV_block_ptr = tl.advance(CV_block_ptr, (BLOCK_N, 0))
-        CK_block_ptr = tl.advance(CK_block_ptr, (0, BLOCK_N))
         Mask_block += BLOCK_N * stride_mn
+
+    # dense kernel test
+    # for start_n in range(0, N_CTX, BLOCK_N):
+    #     cols = start_n + offs_n
+    #     n_mask = cols < seqlen
+    #     k = tl.load(k_ptrs + cols[None, :] * stride_kn, mask=n_mask[None, :], other=0.0)
+    #     v = tl.load(v_ptrs + cols[:, None] * stride_vn, mask=n_mask[:, None], other=0.0)
+
+    #     qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    #     causal_mask = cols[None, :] <= offs_m[:, None]
+    #     qk = tl.where(m_mask & causal_mask, qk, float("-inf"))
+    #     qk += tl.dot(q, k)
+
+    #     # -- compute scaling constant --
+    #     m_i_new = tl.maximum(m_i, tl.max(qk, 1))
+    #     alpha = tl.math.exp2(m_i - m_i_new)
+    #     p = tl.math.exp2(qk - m_i_new[:, None])
+    #     # -- scale and update acc --
+    #     acc_scale = l_i * 0 + alpha  # workaround some compiler bug
+    #     acc *= acc_scale[:, None]
+    #     acc += tl.dot(p.to(dtype), v)
+    #     # -- update m_i and l_i --
+    #     l_i = l_i * alpha + tl.sum(p, 1)
+    #     m_i = m_i_new
 
     for block_index in range(num_blks):
         start_n = tl.load(blks_ptr + block_index)
@@ -211,9 +226,9 @@ def _triton_mixed_sparse_attn_fwd_kernel(
         l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_i_new
 
-    for start_n in range(0, num_cols, BLOCK_N):
-        n_mask = start_n + offs_n < num_cols
-        cols = tl.load(cols_ptr + start_n + offs_n, mask=n_mask, other=0)
+    for start_n2 in range(0, num_cols, BLOCK_N):
+        n_mask = start_n2 + offs_n < num_cols
+        cols = tl.load(cols_ptr + start_n2 + offs_n, mask=n_mask, other=0)
         # -- load k, v --
         k = tl.load(k_ptrs + cols[None, :] * stride_kn, mask=n_mask[None, :], other=0.0)
         v = tl.load(v_ptrs + cols[:, None] * stride_vn, mask=n_mask[:, None], other=0.0)
@@ -269,6 +284,10 @@ def _triton_mixed_sparse_attention(
                          ck.size(-2),
                          device=q.device,
                          dtype=q.dtype)
+
+    # print(f"{cmask.stride()=}")
+    # print(f"before kernel {N_CKV=}")
+    # print(f"before kernel {ck.stride()=} {cv.stride()=}")
 
     _triton_mixed_sparse_attn_fwd_kernel[grid](
         ck,
