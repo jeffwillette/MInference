@@ -10,7 +10,10 @@ from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repea
 
 from ..modules.flexprefill import flexprefill_forward
 from ..modules.kivi import kivi_forward
-from ..modules.minference_forward import minference_prefill_forward
+from ..modules.minference_forward import (
+    minference_delta_prefill_forward,
+    minference_prefill_forward,
+)
 from ..modules.quest import quest_decode_kernel
 from ..modules.retr_attn import retr_attn
 from ..ops.streaming_kernel import a_shape_kernel, tri_shape_kernel
@@ -37,6 +40,8 @@ def attn_forward(
 
     bsz, q_len, _ = hidden_states.size()
 
+    # hack to get around doing these steps when benchmarking latency
+
     if "num_heads" not in self.__dict__:
         self.is_transformers_v448_or_later = True
         self.num_heads = self.config.num_attention_heads
@@ -45,6 +50,12 @@ def attn_forward(
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
+
+        if isinstance(
+            self.q_proj, torch.nn.Identity
+        ):  # hack to allow for benchmarking minference for latency
+            key_states = key_states[:, :, :1024]
+            value_states = value_states[:, :, :1024]
     else:
         qkv = self.qkv_proj(hidden_states)
         query_pos = self.num_heads * self.head_dim
@@ -99,6 +110,7 @@ def attn_forward(
             self.layer_idx,
             cache_kwargs,
         )
+
     if query_states.size(1) != key_states.size(1):
         key_states = repeat_kv(key_states, query_states.size(1) // key_states.size(1))
         value_states = repeat_kv(
@@ -186,6 +198,7 @@ prefill_forwards = {  # None = use flash attention
     "a_shape": a_shape_kernel,
     "tri_shape": tri_shape_kernel,
     "minference": minference_prefill_forward,
+    "minference-delta": minference_delta_prefill_forward,
     "flexprefill": flexprefill_forward,
 }
 

@@ -86,6 +86,12 @@ class MInference:
                 self.config.attn_kwargs.setdefault("best_pattern", json.load(f))
             model = new_patch(model, self.config)
 
+        elif self.config.attn_type == "minference-delta":
+            print(f"setting up MInference delta")
+            with open(self.config.config_path, "r") as f:
+                self.config.attn_kwargs.setdefault("best_pattern", json.load(f))
+            model = new_patch(model, self.config)
+
         elif self.config.attn_type == "a_shape":
             self.config.attn_kwargs.setdefault("n_local", 3968)
             self.config.attn_kwargs.setdefault("n_init", 128)
