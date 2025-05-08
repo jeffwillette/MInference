@@ -9,6 +9,7 @@ from .configs.model2path import MODEL2PATH
 class MInferenceConfig:
     MINFERENCE_ATTENTION_TYPES = [
         "minference",
+        "minference-delta",
         "vllm_minference",
     ]
     OTHER_ATTENTION_TYPES = [

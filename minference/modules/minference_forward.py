@@ -2,12 +2,13 @@
 # Licensed under The MIT License [see LICENSE for details]
 
 import inspect
+import math
 import json
 import os
 import warnings
 from importlib import import_module
 
-from hip_research.utils.triton_recompute import attention as recomp_attn
+from .triton_recompute import attention as recomp_attn
 from transformers.models.llama.modeling_llama import rotate_half
 from transformers.utils import is_flash_attn_2_available
 from transformers.utils.import_utils import _is_package_available
@@ -124,26 +125,29 @@ def init_minference_parameters(self):
 
 def sum_all_diagonal_matrix(mat: torch.tensor):
     b, h, n, m = mat.shape
-    zero_mat = torch.zeros((b, h, n, n)).to(mat.device)  # Zero matrix used for padding
+    zero_mat = torch.zeros((b, h, n, n)).to(
+        mat.device)  # Zero matrix used for padding
     mat_padded = torch.cat(
         (zero_mat, mat, zero_mat), -1
     )  # pads the matrix on left and right
     mat_strided = mat_padded.as_strided(
         (1, 1, n, n + m), (1, n * (2 * n + m), 2 * n + m + 1, 1)
     )  # Change the strides
-    sum_diags = torch.sum(mat_strided, 2)  # Sums the resulting matrix's columns
+    # Sums the resulting matrix's columns
+    sum_diags = torch.sum(mat_strided, 2)
     return sum_diags[:, :, 1:]
 
 
 def gather(t, dim, i):
     """A broadcasting version of torch.gather."""
     dim += (dim < 0) * t.ndim
-    return t.gather(dim, i.expand(*t.shape[:dim], i.shape[dim], *t.shape[dim + 1 :]))
+    return t.gather(dim, i.expand(*t.shape[:dim], i.shape[dim], *t.shape[dim + 1:]))
 
 
 def gather_qkv(q, k, v, attention_mask):
     attn_weights = (
-        torch.matmul(q, k.transpose(2, 3)) / math.sqrt(q.size(-1)) + attention_mask
+        torch.matmul(q, k.transpose(2, 3)) /
+        math.sqrt(q.size(-1)) + attention_mask
     )
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
         q.dtype
@@ -161,13 +165,15 @@ def search_pattern(q, k, head):
         q_len = q.shape[2]
         qk_idxs = [ii + q_len for ii in list(range(-last_q, 0, 1))]
         qk = (
-            torch.matmul(q[:, :, qk_idxs, :], k.transpose(2, 3)) / math.sqrt(head_dim)
+            torch.matmul(q[:, :, qk_idxs, :], k.transpose(
+                2, 3)) / math.sqrt(head_dim)
             + attention_mask[:, :, qk_idxs]
         )
         qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
         vertical = qk.sum(-2, keepdim=True)
         vertical[..., :30] = torch.inf
-        vertical_topk = torch.topk(-vertical, q_len - vertical_size, -1).indices
+        vertical_topk = torch.topk(-vertical, q_len -
+                                   vertical_size, -1).indices
 
         slash = sum_all_diagonal_matrix(qk)[..., : -last_q + 1]
         slash[..., -30:] = torch.inf
@@ -176,7 +182,8 @@ def search_pattern(q, k, head):
         slash = torch.stack(
             [
                 torch.sparse.spdiags(
-                    torch.ones(slash_size, q_len), slash.cpu()[0][_], (q_len, q_len)
+                    torch.ones(slash_size, q_len), slash.cpu()[
+                        0][_], (q_len, q_len)
                 ).to_dense()
                 for _ in range(1)
             ]
@@ -189,7 +196,7 @@ def search_pattern(q, k, head):
             vertical_topk.expand(
                 *est_attn.shape[:dim],
                 vertical_topk.shape[dim],
-                *est_attn.shape[dim + 1 :],
+                *est_attn.shape[dim + 1:],
             ),
             0,
         )
@@ -213,7 +220,8 @@ def search_pattern(q, k, head):
     def stream_llm(vertical_size, slash_size):
         q_len = q.shape[2]
 
-        mask = torch.triu(torch.tril(torch.ones(q_len, q_len), 0), -slash_size).to(q)
+        mask = torch.triu(torch.tril(torch.ones(
+            q_len, q_len), 0), -slash_size).to(q)
         mask[:, :vertical_size] = 1
         mask = mask.unsqueeze(0).unsqueeze(1)
 
@@ -245,13 +253,15 @@ def search_pattern(q, k, head):
             + attention_mask[:, :, :block_num, :block_num]
         )
         est_attn = torch.ones_like(qk)
-        block_topk = torch.topk(-qk, block_num - block_num // topk_ratio, -1).indices
+        block_topk = torch.topk(-qk, block_num -
+                                block_num // topk_ratio, -1).indices
 
         dim = 3
         est_attn = est_attn.scatter(
             3,
             block_topk.expand(
-                *est_attn.shape[:dim], block_topk.shape[dim], *est_attn.shape[dim + 1 :]
+                *est_attn.shape[:dim], block_topk.shape[dim], *
+                est_attn.shape[dim + 1:]
             ),
             0,
         )
@@ -290,7 +300,8 @@ def search_pattern(q, k, head):
     else:
         attention_mask = SEARCH_MASK.to(q.device)
     attn_weights = (
-        torch.matmul(q, k.transpose(2, 3)) / math.sqrt(head_dim) + attention_mask
+        torch.matmul(q, k.transpose(2, 3)) /
+        math.sqrt(head_dim) + attention_mask
     )
     attn_weights = torch.nn.functional.softmax(
         attn_weights, dim=-1, dtype=torch.float32
@@ -401,24 +412,27 @@ def search_pattern_v2(q, k, v, head):
 
 def shift_matrix(mat):
     b, h, _, n = mat.shape
-    zero_mat = torch.zeros((b, h, n, n)).to(mat.device)  # Zero matrix used for padding
+    zero_mat = torch.zeros((b, h, n, n)).to(
+        mat.device)  # Zero matrix used for padding
     mat_padded = torch.cat(
         (zero_mat, mat, zero_mat), -1
     )  # pads the matrix on left and right
     mat_strided = mat_padded.as_strided(
         (1, 1, n, n + 2 * n), (1, n * (2 * n + n), 2 * n + n - 1, 1)
     )  # Change the strides
-    return mat_strided[..., 2 * n - 1 : -1]
+    return mat_strided[..., 2 * n - 1: -1]
 
 
 def repeat(self, q, k, v, attention_mask):
     q_len = q.shape[2]
     if q_len == 1:
         return gather_qkv(q, k, v, attention_mask)
-    qk = torch.matmul(q[:, :, -1:, :], k.transpose(2, 3)) / math.sqrt(self.head_dim)
+    qk = torch.matmul(q[:, :, -1:, :], k.transpose(2, 3)) / \
+        math.sqrt(self.head_dim)
     qk = qk.repeat(1, 1, q_len, 1)
     qk = shift_matrix(qk) + attention_mask
-    attn_weights = nn.functional.softmax(qk, dim=-1, dtype=torch.float32).to(q.dtype)
+    attn_weights = nn.functional.softmax(
+        qk, dim=-1, dtype=torch.float32).to(q.dtype)
     attn_output = torch.matmul(attn_weights, v)
     return attn_output
 
@@ -440,7 +454,8 @@ def gather_last_q_vertical_slash_topk_v4(self, q, k, v, head_id):
         qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
         vertical = qk.sum(-2, keepdim=True)
         vertical[..., :30] = -self.ne_inf
-        vertical_topk = torch.topk(-vertical, q_len - vertical_size, -1).indices
+        vertical_topk = torch.topk(-vertical, q_len -
+                                   vertical_size, -1).indices
 
         slash = sum_all_diagonal_matrix(qk)[..., : -last_q + 1]
         slash[..., -30:] = -self.ne_inf
@@ -449,7 +464,8 @@ def gather_last_q_vertical_slash_topk_v4(self, q, k, v, head_id):
         slash = torch.stack(
             [
                 torch.sparse.spdiags(
-                    torch.ones(slash_size, q_len), slash.cpu()[0][_], (q_len, q_len)
+                    torch.ones(slash_size, q_len), slash.cpu()[
+                        0][_], (q_len, q_len)
                 ).to_dense()
                 for _ in range(1)
             ]
@@ -462,7 +478,7 @@ def gather_last_q_vertical_slash_topk_v4(self, q, k, v, head_id):
             vertical_topk.expand(
                 *est_attn.shape[:dim],
                 vertical_topk.shape[dim],
-                *est_attn.shape[dim + 1 :],
+                *est_attn.shape[dim + 1:],
             ),
             0,
         )
@@ -475,7 +491,8 @@ def gather_last_q_vertical_slash_topk_v4(self, q, k, v, head_id):
         if self.kv_cache_compressed_v4:
             self.vertical = torch.topk(vertical, vertical_size * 4, -1).indices
             self.slash = (
-                torch.topk(slash_topk, slash_size * 4, -1).indices - (q_len - 1)
+                torch.topk(slash_topk, slash_size *
+                           4, -1).indices - (q_len - 1)
             ).unsqueeze(2)
         return attn_weights
 
@@ -484,7 +501,8 @@ def gather_last_q_vertical_slash_topk_v4(self, q, k, v, head_id):
         vertical_size, slash_size = min(q_len, max(vertical_size, 30)), min(
             q_len, max(slash_size, 50)
         )
-        mask = torch.triu(torch.tril(torch.ones(q_len, q_len), 0), -slash_size).to(q)
+        mask = torch.triu(torch.tril(torch.ones(
+            q_len, q_len), 0), -slash_size).to(q)
         mask[:, :vertical_size] = 1
         mask = mask.unsqueeze(0).unsqueeze(1)
 
@@ -524,13 +542,15 @@ def gather_last_q_vertical_slash_topk_v4(self, q, k, v, head_id):
             + attention_mask[:, :, :block_num, :block_num]
         )
         est_attn = torch.ones_like(qk)
-        block_topk = torch.topk(-qk, block_num - block_num // topk_ratio, -1).indices
+        block_topk = torch.topk(-qk, block_num -
+                                block_num // topk_ratio, -1).indices
 
         dim = 3
         est_attn = est_attn.scatter(
             3,
             block_topk.expand(
-                *est_attn.shape[:dim], block_topk.shape[dim], *est_attn.shape[dim + 1 :]
+                *est_attn.shape[:dim], block_topk.shape[dim], *
+                est_attn.shape[dim + 1:]
             ),
             0,
         )
@@ -550,7 +570,8 @@ def gather_last_q_vertical_slash_topk_v4(self, q, k, v, head_id):
     def dialted(q, k, v, type):
         q_len = q.shape[2]
         n_init = min(1024, q_len)
-        vertical_topk = torch.arange(0, n_init, device=q.device)[None, None, None, :]
+        vertical_topk = torch.arange(0, n_init, device=q.device)[
+            None, None, None, :]
 
         slash = torch.arange(0, q_len, device=q.device)
         if type == "dilated1":
@@ -558,7 +579,8 @@ def gather_last_q_vertical_slash_topk_v4(self, q, k, v, head_id):
             slash = slash[-8192::2][None, None, :]
         elif type == "dilated2":
             # 2k dense local + 4k local with 1 interval
-            slash = torch.cat([slash[-2048:], slash[-6144:-2048:2]], 0)[None, None, :]
+            slash = torch.cat(
+                [slash[-2048:], slash[-6144:-2048:2]], 0)[None, None, :]
 
         slash = (q_len - 1) - slash
         return vertical_slash_sparse_attention(q, k, v, vertical_topk, slash)
@@ -595,12 +617,13 @@ def gather_last_q_vertical_slash_topk_v4(self, q, k, v, head_id):
         last_q = min(64, q_len)
         last_start = 100
         qk = torch.einsum(
-            f"bhmk, bhnk -> bhmn", q[:, :, -last_q - last_start : -last_start, :], k
+            f"bhmk, bhnk -> bhmn", q[:, :, -last_q -
+                                     last_start: -last_start, :], k
         ) / math.sqrt(self.head_dim)
         qk[:, :, :, -last_start:] = -torch.inf
-        qk[:, :, :, -last_q - last_start : -last_start] = torch.where(
+        qk[:, :, :, -last_q - last_start: -last_start] = torch.where(
             LAST_Q_MASK[..., -last_q:, -last_q:].to(q.device),
-            qk[:, :, :, -last_q - last_start : -last_start],
+            qk[:, :, :, -last_q - last_start: -last_start],
             -torch.inf,
         )
         qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
@@ -664,11 +687,14 @@ def gather_last_q_vertical_slash_topk_v4(self, q, k, v, head_id):
             q1, k[:, :, :-n_last], v[:, :, :-n_last], n_init, n_local
         )
 
-        qk = torch.einsum(f"bhmk, bhnk -> bhmn", q2, k) / math.sqrt(self.head_dim)
+        qk = torch.einsum(f"bhmk, bhnk -> bhmn", q2, k) / \
+            math.sqrt(self.head_dim)
         arange = torch.arange(n_last, device="cuda")
         mask = arange[None, None, :, None] >= arange[None, None, None, :]
-        qk[:, :, :, -n_last:] = torch.where(mask, qk[:, :, :, -n_last:], -torch.inf)
-        qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32).to(q.dtype)
+        qk[:, :, :, -
+            n_last:] = torch.where(mask, qk[:, :, :, -n_last:], -torch.inf)
+        qk = torch.nn.functional.softmax(
+            qk, dim=-1, dtype=torch.float32).to(q.dtype)
         y2 = torch.einsum(f"bhmn, bhnk -> bhmk", qk, v)
         return torch.cat([y1, y2], dim=2)
 
@@ -774,7 +800,8 @@ def minference_forward():
                     "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                     "with a layer index."
                 )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            kv_seq_len += past_key_value.get_usable_length(
+                kv_seq_len, self.layer_idx)
         set_rope_type(self)
         cos, sin = get_cos_sin(self, value_states, kv_seq_len, position_ids)
         if ROPE_TYPE == "max_seq_len":
@@ -831,7 +858,7 @@ def minference_forward():
                     ).view(bsz, 1, q_len, self.head_dim)
                 else:
                     attn_output = gather_qkv(q, k, v, attention_mask)
-                output[:, head : head + 1] = attn_output
+                output[:, head: head + 1] = attn_output
             if self.is_search:
                 if len(config):
                     config_list.append(config)
@@ -847,7 +874,8 @@ def minference_forward():
                 causal=q_len != 1,
             ).view(bsz, query_states.size(1), q_len, self.head_dim)
         attn_output = output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
+        attn_output = attn_output.reshape(
+            bsz, q_len, self.num_heads * self.head_dim)
         attn_output = self.o_proj(attn_output)
 
         return attn_output, None, past_key_value
@@ -916,7 +944,8 @@ def minference_prefill_forward(
     value_states,
     prefill_kwargs,
 ):
-    starting_layer = prefill_kwargs["attn_forward_config"].get("starting_layer", 0)
+    starting_layer = prefill_kwargs["attn_forward_config"].get(
+        "starting_layer", 0)
     layer_idx = prefill_kwargs["layer_idx"]
 
     output = torch.empty_like(query_states)
@@ -938,7 +967,7 @@ def minference_prefill_forward(
                 softmax_scale=None,
                 causal=q_len != 1,
             ).view(bsz, 1, q_len, head_dim)
-        output[:, head : head + 1] = attn_output
+        output[:, head: head + 1] = attn_output
     return output
 
 
@@ -948,7 +977,8 @@ def minference_delta_prefill_forward(
     value_states,
     prefill_kwargs,
 ):
-    starting_layer = prefill_kwargs["attn_forward_config"].get("starting_layer", 0)
+    starting_layer = prefill_kwargs["attn_forward_config"].get(
+        "starting_layer", 0)
     layer_idx = prefill_kwargs["layer_idx"]
 
     output = torch.empty_like(query_states)
@@ -970,9 +1000,8 @@ def minference_delta_prefill_forward(
                 softmax_scale=None,
                 causal=q_len != 1,
             ).view(bsz, 1, q_len, head_dim)
-        output[:, head : head + 1] = attn_output
+        output[:, head: head + 1] = attn_output
 
-    print(f"doing minference delta forward")
     output = output.transpose(1, 2)
 
     # postfix_recompute_dense-window_[size:int]-diff_[1/0]-w_[size:int]
@@ -997,14 +1026,16 @@ def minference_delta_prefill_forward(
         idx = torch.arange(0, s_p, step=w, device=query_states.device)
         sparse_out_diff_states = output[:, idx]
 
-        idx = torch.cat((idx, torch.arange(s_p, s, device=query_states.device)))
+        idx = torch.cat(
+            (idx, torch.arange(s_p, s, device=query_states.device)))
         recomp_query_states = query_states[:, :, idx]
 
     # do the strided dense attention
     # key_states = repeat_kv(key_states, module.num_key_value_groups)
     # value_states = repeat_kv(value_states, module.num_key_value_groups)
     dense_attn_output = recomp_attn(
-        recomp_query_states, key_states, value_states, idx.unsqueeze(0), scaling
+        recomp_query_states, key_states, value_states, idx.unsqueeze(
+            0), 1 / math.sqrt(d)
     )
     dense_attn_output = dense_attn_output.transpose(1, 2)
 
@@ -1013,7 +1044,7 @@ def minference_delta_prefill_forward(
         out = torch.zeros_like(query_states).transpose(1, 2)
         out[:, :s_p] = output
         out[:, idx] = dense_attn_output
-        return out, None
+        return out.transpose(1, 2)
 
     # save last states for concat later
     dense_attn_output, last_states = (
@@ -1027,7 +1058,8 @@ def minference_delta_prefill_forward(
     dense_sparse_diff = dense_sparse_diff.reshape(b, s_p // w, 1, h, d)
     sparse_attn_output = output.reshape(b, s_p // w, w, h, d)
 
-    sparse_attn_output = (dense_sparse_diff + sparse_attn_output).reshape(b, s_p, h, d)
+    sparse_attn_output = (dense_sparse_diff +
+                          sparse_attn_output).reshape(b, s_p, h, d)
 
     window_attn_output = torch.cat((sparse_attn_output, last_states), dim=1)
 
@@ -1051,7 +1083,8 @@ def minference_kv_cache_cpu_forward():
         bsz, q_len, hidden_dim = hidden_states.size()
         kv_seq_len = q_len
         if use_cache and past_key_value is not None:
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            kv_seq_len += past_key_value.get_usable_length(
+                kv_seq_len, self.layer_idx)
 
         set_rope_type(self)
         cos, sin = get_cos_sin(self, hidden_states, kv_seq_len, position_ids)
@@ -1086,10 +1119,12 @@ def minference_kv_cache_cpu_forward():
                     ],
                 ).unsqueeze(2)
                 if self.q_proj.bias is not None:
-                    part_q += self.q_proj.bias.view(self.num_heads, self.head_dim)[head]
+                    part_q += self.q_proj.bias.view(self.num_heads,
+                                                    self.head_dim)[head]
             else:
                 if hidden_states.device != self.qkv_proj.weight.device:
-                    hidden_states = hidden_states.to(self.qkv_proj.weight.device)
+                    hidden_states = hidden_states.to(
+                        self.qkv_proj.weight.device)
                     attn_out = attn_out.to(self.qkv_proj.weight.device)
                 query_pos = self.num_heads * self.head_dim
                 part_q = F.linear(
@@ -1287,11 +1322,14 @@ def gather_last_q_vertical_slash_topk_vllm(self, q, k, v, head_id):
         y1 = streaming_forward(
             q1, k[:, :, :-n_last], v[:, :, :-n_last], n_init, n_local
         )
-        qk = torch.einsum(f"bhmk, bhnk -> bhmn", q2, k) / math.sqrt(q2.shape[-1])
+        qk = torch.einsum(f"bhmk, bhnk -> bhmn", q2, k) / \
+            math.sqrt(q2.shape[-1])
         arange = torch.arange(n_last, device="cuda")
         mask = arange[None, None, :, None] >= arange[None, None, None, :]
-        qk[:, :, :, -n_last:] = torch.where(mask, qk[:, :, :, -n_last:], -torch.inf)
-        qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32).to(q.dtype)
+        qk[:, :, :, -
+            n_last:] = torch.where(mask, qk[:, :, :, -n_last:], -torch.inf)
+        qk = torch.nn.functional.softmax(
+            qk, dim=-1, dtype=torch.float32).to(q.dtype)
         y2 = torch.einsum(f"bhmn, bhnk -> bhmk", qk, v)
         return torch.cat([y1, y2], dim=2)
 
@@ -1305,14 +1343,16 @@ def gather_last_q_vertical_slash_topk_vllm(self, q, k, v, head_id):
         vertical_size = int(
             vertical_size * self.patch_config.get("minference_ratio", 1)
         )
-        slash_size = int(slash_size * self.patch_config.get("minference_ratio", 1))
+        slash_size = int(
+            slash_size * self.patch_config.get("minference_ratio", 1))
 
     if q_len == 1:
         return dense(q, k, v)
 
     if self.patch_config.get("flexprefill", False):
         return flexprefill_forward(
-            q, k, v, {"attn_forward_config": self.patch_config["flexprefill_kwargs"]}
+            q, k, v, {
+                "attn_forward_config": self.patch_config["flexprefill_kwargs"]}
         )
     if self.patch_config.get("a_shape", False):
         return streaming_forward(
@@ -1410,7 +1450,7 @@ def minference_vllm_forward(
                 )
 
                 out = out.transpose(1, 2).squeeze(0).contiguous()
-                output[:, head : head + 1, :] = out
+                output[:, head: head + 1, :] = out
             return output
 
         num_tokens, hidden_size = query.shape
@@ -1579,7 +1619,7 @@ def minference_vllm_forward(
                 )
 
                 out = out.transpose(1, 2).squeeze(0).contiguous()
-                output[:, head : head + 1, :] = out
+                output[:, head: head + 1, :] = out
             return output
 
         num_tokens, hidden_size = query.shape
@@ -1750,7 +1790,7 @@ def minference_vllm_forward(
                 )
 
                 out = out.transpose(1, 2).squeeze(0).contiguous()
-                output[:, head : head + 1, :] = out
+                output[:, head: head + 1, :] = out
             return output
 
         num_tokens, hidden_size = query.shape
