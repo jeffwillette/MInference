@@ -107,9 +107,10 @@ def evaluate(model, tokenizer):
 
                     model.config._attn_implementation = prev_attn
 
-                    print(
-                        f"{ctx_len=} {attn=} {postfix=}: elapsed time: {sum(times) / len(times):.3f} ms"
-                    )
+                    if len(times) > 0:
+                        print(
+                            f"{ctx_len=} {attn=} {postfix=}: elapsed time: {sum(times) / len(times):.3f} ms"
+                        )
 
 
 def init_model():
