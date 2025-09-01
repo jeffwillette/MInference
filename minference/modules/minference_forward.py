@@ -500,7 +500,7 @@ def minference_forward():
         hidden_states,
         attention_mask,
         position_ids,
-        past_key_value,
+        past_key_values,
         output_attentions,
         use_cache,
         **kwargs,
@@ -525,14 +525,14 @@ def minference_forward():
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
+        if past_key_values is not None:
             if self.layer_idx is None:
                 raise ValueError(
                     f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
                     "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                     "with a layer index."
                 )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            kv_seq_len += past_key_values.get_usable_length(kv_seq_len, self.layer_idx)
         set_rope_type(self)
         cos, sin = get_cos_sin(self, value_states, kv_seq_len, position_ids)
         if ROPE_TYPE == "max_seq_len":
@@ -545,9 +545,9 @@ def minference_forward():
                 position_ids = position_ids.to(cos.device)
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
-        if past_key_value is not None:
+        if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -560,6 +560,7 @@ def minference_forward():
                 config_list = []
             config = {}
             print("Layer", self.layer_idx)
+
         if q_len != 1:
             output = torch.empty_like(query_states)
             for head in range(query_states.size(1)):
@@ -586,7 +587,7 @@ def minference_forward():
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
         attn_output = self.o_proj(attn_output)
 
-        return attn_output, None, past_key_value
+        return attn_output, None, past_key_values
 
     return forward
 
@@ -607,6 +608,7 @@ def minference_prefill_kernel(
         vertical_topk = torch.topk(vertical, vertical_size, -1).indices
 
         slash = sum_all_diagonal_matrix(qk)[...,:-last_q + 1]
+
         slash[...,-100:] = torch.inf
         slash_topk = slash
         slash = (q_len - 1) - torch.topk(slash, slash_size, -1).indices
@@ -679,7 +681,7 @@ def minference_kv_cache_cpu_forward():
         hidden_states,
         attention_mask,
         position_ids,
-        past_key_value,
+        past_key_values,
         output_attentions,
         use_cache,
         **kwargs,
@@ -689,8 +691,8 @@ def minference_kv_cache_cpu_forward():
 
         bsz, q_len, hidden_dim = hidden_states.size()
         kv_seq_len = q_len
-        if use_cache and past_key_value is not None:
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+        if use_cache and past_key_values is not None:
+            kv_seq_len += past_key_values.get_usable_length(kv_seq_len, self.layer_idx)
 
         set_rope_type(self)
         cos, sin = get_cos_sin(self, hidden_states, kv_seq_len, position_ids)
@@ -753,10 +755,10 @@ def minference_kv_cache_cpu_forward():
                     if position_ids is not None and position_ids.device != cos.device:
                         position_ids = position_ids.to(cos.device)
                     part_k = apply_rotary_pos_emb_single(part_k.transpose(1, 2), cos, sin, position_ids)
-                if use_cache and past_key_value is not None:
+                if use_cache and past_key_values is not None:
                     k[:,head // self.num_key_value_groups] = part_k.to(kv_cache_cpu_device)
                     v[:,head // self.num_key_value_groups] = part_v.to(kv_cache_cpu_device)
-                    part_k, part_v = past_key_value.get(part_k, part_v, self.layer_idx, head // self.num_key_value_groups, cache_kwargs)
+                    part_k, part_v = past_key_values.get(part_k, part_v, self.layer_idx, head // self.num_key_value_groups, cache_kwargs)
 
             if self.layer_idx >= self.starting_layer:
                 part_o = self.gather_last_q_vertical_slash_topk_v4(part_q, part_k, part_v, head)
@@ -764,11 +766,11 @@ def minference_kv_cache_cpu_forward():
                 part_o = flash_attn_func(part_q, part_k, part_v.transpose(1, 2), 0.0, softmax_scale=None, causal=True).view(bsz, part_q.shape[1], self.head_dim)
             attn_out[:, :, head, :] = part_o
 
-        if use_cache and past_key_value is not None:
-            past_key_value.update(k, v, self.layer_idx, cache_kwargs)
+        if use_cache and past_key_values is not None:
+            past_key_values.update(k, v, self.layer_idx, cache_kwargs)
         torch.matmul(attn_out.view(bsz, q_len, hidden_dim), self.o_proj.weight.T, out=hidden_states)
         torch.cuda.empty_cache()
-        return (hidden_states, None, past_key_value)
+        return (hidden_states, None, past_key_values)
 
     return forward
 

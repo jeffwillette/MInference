@@ -30,7 +30,7 @@ def attn_forward(
     position_embeddings: Optional[
         Tuple[torch.Tensor, torch.Tensor]
     ] = None,  # will become mandatory in v4.46
-    past_key_value: Cache = None,
+    past_key_values: Cache = None,
     prefill_forward=None,
     decoding_forward=None,
     customized_rope_func=None,
@@ -40,6 +40,9 @@ def attn_forward(
     output_attentions = False
 
     bsz, q_len, _ = hidden_states.size()
+
+    if past_key_values is not None:
+        use_cache = True
 
     if "num_heads" not in self.__dict__:
         self.is_transformers_v448_or_later = True
@@ -86,7 +89,7 @@ def attn_forward(
             query_states, key_states, cos, sin
         )
 
-    if past_key_value is not None:
+    if past_key_values is not None:
         # sin and cos are specific to RoPE models; cache_position needed for the static cache
         cache_kwargs = {
             "sin": sin,
@@ -104,7 +107,7 @@ def attn_forward(
                 key_states_mid,
                 value_states_mid,
                 value_states_full,
-            ) = past_key_value.update(
+            ) = past_key_values.update(
                 key_states,
                 value_states,
                 self.layer_idx,
@@ -117,7 +120,7 @@ def attn_forward(
             (
                 key_states,
                 value_states,
-            ) = past_key_value.update(  # DynamicCache/KvcompressCache
+            ) = past_key_values.update(  # DynamicCache/KvcompressCache
                 key_states,
                 value_states,
                 self.layer_idx,
@@ -132,8 +135,11 @@ def attn_forward(
         )
 
     dropout_rate = self.attention_dropout if self.training else 0.0
+    # print(f"{use_cache=} {q_len=}")
+    # if past_key_values is not None:
+    #     print(f"{past_key_values.get_seq_length(self.layer_idx)}")
 
-    if not use_cache or q_len == past_key_value.get_seq_length(
+    if not use_cache or q_len == past_key_values.get_seq_length(
         self.layer_idx
     ):  # use no cache or prefilling
         # if q_len != 1: # prefilling
@@ -231,7 +237,7 @@ def attn_forward(
 
     if "is_transformers_v448_or_later" in self.__dict__:
         return attn_output, attn_weights
-    return attn_output, attn_weights, past_key_value
+    return attn_output, attn_weights, past_key_values
 
 
 prefill_forwards = {  # None = use flash attention

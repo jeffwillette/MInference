@@ -219,7 +219,7 @@ def huggingface_forward(forward):
         hidden_states: torch.Tensor,
         attention_mask=None,
         position_ids=None,
-        past_key_value=None,
+        past_key_values=None,
         output_attentions: bool = False,
         use_cache: bool = False,
         **kwargs,
@@ -271,7 +271,7 @@ def huggingface_forward(forward):
             hidden_states,
             position_ids,
             use_cache,
-            past_key_value,
+            past_key_values,
             self.q_proj,
             self.k_proj,
             self.v_proj,
@@ -502,7 +502,7 @@ def forward_llama_decoder_layer(
     hidden_states: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.LongTensor] = None,
-    past_key_value: Optional[Cache] = None,
+    past_key_values: Optional[Cache] = None,
     output_attentions: Optional[bool] = False,
     use_cache: Optional[bool] = False,
     cache_position: Optional[torch.LongTensor] = None,
@@ -512,6 +512,7 @@ def forward_llama_decoder_layer(
     chunk_size: int = 96_000,
     **kwargs,
 ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+
     residual = hidden_states.clone()
     batch, seq_len, embed_dim = hidden_states.shape
     if chunk_size == -1:
@@ -528,7 +529,7 @@ def forward_llama_decoder_layer(
         hidden_states=hidden_states,
         attention_mask=attention_mask,
         position_ids=position_ids,
-        past_key_value=past_key_value,
+        past_key_values=past_key_values,
         output_attentions=output_attentions,
         use_cache=use_cache,
         cache_position=cache_position,
@@ -548,14 +549,16 @@ def forward_llama_decoder_layer(
         part_hidden_states = self.mlp(part_hidden_states)
         hidden_states[:, start_idx:end_idx, :] += part_hidden_states
 
-    outputs = (hidden_states,)
-    if output_attentions:
-        outputs += (self_attn_weights,)
+    return hidden_states
 
-    if use_cache and len(attention_outputs) == 3:
-        outputs += (attention_outputs[-1],)
+    # outputs = (hidden_states,)
+    # if output_attentions:
+    #     outputs += (self_attn_weights,)
 
-    return outputs
+    # if use_cache and len(attention_outputs) == 3:
+    #     outputs += (attention_outputs[-1],)
+
+    # return outputs
 
 
 def forward_llama_model(
@@ -870,9 +873,10 @@ def new_patch(model, config):
 
     def update_module(m):
         if isinstance(m, Attention):
-            m.forward = (
-                lambda self, *args, **kwargs: forward(self, *args, **kwargs)
-            ).__get__(m, Attention)
+            def fwd(self, *args, **kwargs):
+                return forward(self, *args, **kwargs)
+
+            m.forward = fwd.__get__(m, Attention)
         if isinstance(m, DecoderLayer):
             m.forward = forward_llama_decoder_layer.__get__(m, DecoderLayer)
 
@@ -889,6 +893,7 @@ def new_patch(model, config):
         model, model.__class__
     )
 
+    print(f"Patched model for {config.attn_type} with {config.kv_type} ..")
     return model
 
 

@@ -373,6 +373,10 @@ class DynamicCacheWithRepeat(DynamicCache):
         self.temp_key_cache = []
         self.temp_value_cache = []
 
+        self.key_cache = []
+        self.value_cache = []
+        self._seen_tokens = 0
+
     def update(
         self,
         key_states: torch.Tensor,
